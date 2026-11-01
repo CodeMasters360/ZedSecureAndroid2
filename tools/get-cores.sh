@@ -52,7 +52,7 @@ case "$TARGET" in
     cp "$(fetch zedcore zedcore.aar)" "$ROOT/app/libs/zedcore.aar"
     for abi in arm64-v8a armeabi-v7a x86_64; do
       mkdir -p "$jni/$abi"
-      for core in tor snispoof hev; do
+      for core in tor snispoof hev openconnect; do
         unzip -q -o "$(fetch "$core" "$core-android-$abi.zip")" -d "$jni/$abi"
       done
     done
@@ -98,7 +98,8 @@ case "$TARGET" in
     cp "$(fetch psiphon "psiphon-macos-$arch")" "$bin/psiphon"
     cp "$(fetch hev "hev-macos-$arch")" "$bin/hev-socks5-tunnel"
     tor_tree "$(fetch tor "tor-macos-$arch.zip")" "$bin/tor"
-    chmod +x "$bin/xray" "$bin/zeptun" "$bin/zeddns" "$bin/masterdns" "$bin/psiphon" "$bin/hev-socks5-tunnel"
+    chmod +x "$bin/xray" "$bin/zeptun" "$bin/zeddns" "$bin/masterdns" "$bin/psiphon" "$bin/hev-macos-x86_64" 2>/dev/null || true
+    chmod +x "$bin/hev-socks5-tunnel" 2>/dev/null || true
     ;;
   *)
     echo "unknown target $TARGET" >&2
