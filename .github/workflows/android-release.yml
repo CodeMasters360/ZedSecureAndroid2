@@ -39,43 +39,96 @@ jobs:
       - name: Build OpenConnect natively
         run: |
           set -e
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake libtool pkg-config gettext libssl-dev
+          # ۱. نصب پیش‌نیازهای بیلد برای لینوکس میزبان
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq autoconf automake libtool pkg-config gettext
+          
+          # ۲. راه‌اندازی و دریافت NDK
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358"
           newest=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -1)
-          NDK="$ANDROID_HOME/ndk/$newest"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$newest"
+          TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
           export PATH="$TOOLCHAIN/bin:$PATH"
-          export ANDROID_NDK_ROOT="$NDK"
           
-          WORK="/tmp/openconnect-build"
+          WORK="/tmp/oc-build"
           mkdir -p "$WORK"
+          
+          # ۳. دانلود سورس‌های OpenSSL و OpenConnect
+          echo ">>> Fetching sources..."
+          curl -fsSL --retry 3 -o "$WORK/openssl.tar.gz" "https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz"
           git clone --depth 1 --branch "v9.12" https://gitlab.com/openconnect/openconnect.git "$WORK/openconnect"
           
           API=24
           for abi in arm64-v8a armeabi-v7a x86_64; do
             case "$abi" in
-              arm64-v8a)   host=aarch64-linux-android; cc=aarch64-linux-android$API-clang ;;
-              armeabi-v7a) host=arm-linux-androideabi; cc=armv7a-linux-androideabi$API-clang ;;
-              x86_64)      host=x86_64-linux-android;  cc=x86_64-linux-android$API-clang ;;
+              arm64-v8a)   ossl_arch=android-arm64;  host=aarch64-linux-android; cc=aarch64-linux-android$API-clang ;;
+              armeabi-v7a) ossl_arch=android-arm;    host=arm-linux-androideabi; cc=armv7a-linux-androideabi$API-clang ;;
+              x86_64)      ossl_arch=android-x86_64; host=x86_64-linux-android;  cc=x86_64-linux-android$API-clang ;;
             esac
+            
+            echo "=========================================================="
+            echo ">>> Building for ABI: $abi"
+            echo "=========================================================="
+            
             build="$WORK/$abi"
-            rm -rf "$build" && mkdir -p "$build"
-            cp -r "$WORK/openconnect" "$build/src"
+            prefix="$build/prefix"
+            mkdir -p "$build" "$prefix"
+            
             export CC="$cc" AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
             
-            (cd "$build/src" &&
-              ./autogen.sh >/dev/null 2>&1 &&
-              LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
-              ./configure --host="$host" \
-                --disable-nls --without-libpcsclite --without-stoken --without-libpskc \
-                --without-gssapi --with-openssl --enable-shared --disable-static >/dev/null 2>&1 &&
-              make -j"$(nproc)" libopenconnect.la >/dev/null 2>&1)
+            # --- بیلدِ OpenSSL ---
+            echo ">>> [$abi] 1. Compiling static OpenSSL..."
+            tar -xzf "$WORK/openssl.tar.gz" -C "$build"
+            (
+              cd "$build/openssl-3.0.15"
+              ./Configure "$ossl_arch" -D__ANDROID_API__="$API" no-shared no-tests --prefix="$prefix" --libdir=lib
+              make -j"$(nproc)" > /dev/null
+              make install_sw > /dev/null
+            )
             
+            # --- بیلدِ OpenConnect ---
+            echo ">>> [$abi] 2. Compiling OpenConnect..."
+            cp -r "$WORK/openconnect" "$build/openconnect"
+            (
+              cd "$build/openconnect"
+              
+              echo ">>> Running autogen.sh..."
+              ./autogen.sh
+              
+              echo ">>> Running configure..."
+              export CFLAGS="-I$prefix/include -fPIC"
+              # تنظیم 16KB Alignment برای اندروید ۱۵
+              export LDFLAGS="-L$prefix/lib -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+              export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
+              
+              # کانفیگ به همراه لینک کردن OpenSSL اختصاصی
+              ./configure --host="$host" \
+                --prefix="$prefix" \
+                --with-openssl \
+                --without-gnutls \
+                --without-libxml2 \
+                --disable-nls \
+                --without-libpcsclite \
+                --without-stoken \
+                --without-libpskc \
+                --without-gssapi \
+                --enable-shared \
+                --disable-static || { 
+                  echo "::error::Configure failed for $abi! Printing config.log:"
+                  cat config.log
+                  exit 1
+                }
+                
+              echo ">>> Running make..."
+              make -j"$(nproc)" libopenconnect.la
+            )
+            
+            # --- استخراج فایل و استریپ ---
             mkdir -p "app/src/main/jniLibs/$abi"
-            cp "$build/src/.libs/libopenconnect.so" "app/src/main/jniLibs/$abi/libopenconnect.so"
+            cp "$build/openconnect/.libs/libopenconnect.so" "app/src/main/jniLibs/$abi/libopenconnect.so"
             llvm-strip "app/src/main/jniLibs/$abi/libopenconnect.so"
+            echo ">>> [$abi] SUCCESS!"
           done
 
       - name: Check the engines
