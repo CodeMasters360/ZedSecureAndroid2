@@ -1,0 +1,31 @@
+name: inspect-openconnect
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect OpenConnect APKs on F-Droid
+        run: |
+          set -e
+          echo "================================================="
+          echo "1. Checking files inside 1120.apk:"
+          echo "================================================="
+          curl -fsSL -o oc_1120.apk "https://f-droid.org/repo/net.openconnect_vpn.android_1120.apk"
+          unzip -l oc_1120.apk "lib/*" || echo "No lib folder!"
+          
+          echo ""
+          echo "================================================="
+          echo "2. Scanning nearby version codes on F-Droid:"
+          echo "================================================="
+          for v in 1115 1116 1117 1118 1119 1120 1121 1122 1123 1124 1125 1110 1130; do
+            url="https://f-droid.org/repo/net.openconnect_vpn.android_${v}.apk"
+            code=$(curl -s -o /dev/null -w "%{http_code}" --head "$url")
+            if [ "$code" = "200" ]; then
+              echo ">>> [HTTP 200 FOUND]: $url"
+              curl -fsSL -o "cand.apk" "$url"
+              unzip -l cand.apk "lib/*" | awk '{print $4}' | grep '^lib/' || true
+            fi
+          done
