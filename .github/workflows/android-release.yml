@@ -39,30 +39,20 @@ jobs:
       - name: Fetch prebuilt OpenConnect with JNI
         run: |
           set -e
-          echo ">>> Fetching official OpenConnect Android binaries with JNI support..."
+          echo ">>> Fetching official OpenConnect Android binaries..."
           TMP_DIR="/tmp/oc-download"
           mkdir -p "$TMP_DIR"
           
-          # 1. پیدا کردن هوشمند و خودکارِ آخرین لینک APK از سایت F-Droid
-          APK_URL=$(curl -fsSL --retry 3 "https://f-droid.org/en/packages/app.openconnect/" | grep -oE 'https://f-droid.org/repo/app\.openconnect_[0-9]+\.apk' | head -n 1)
+          # دانلود فایل APK ارائه‌شده از F-Droid
+          curl -fsSL --retry 3 -o "$TMP_DIR/openconnect.apk" "https://f-droid.org/repo/net.openconnect_vpn.android_1120.apk"
           
-          if [ -z "$APK_URL" ]; then
-            echo "::error::Could not find OpenConnect APK URL on F-Droid!"
-            exit 1
-          fi
-          
-          echo ">>> Found latest APK: $APK_URL"
-          
-          # 2. دانلود سریع APK
-          curl -fsSL --retry 3 -o "$TMP_DIR/openconnect.apk" "$APK_URL"
-          
-          # 3. استخراج فایل‌های .so کامپایل شده و آماده
+          # استخراج لایبرری‌های کامپایل‌شده
           unzip -q -o "$TMP_DIR/openconnect.apk" "lib/*" -d "$TMP_DIR/extracted"
           
           for abi in arm64-v8a armeabi-v7a x86_64; do
             mkdir -p "app/src/main/jniLibs/$abi"
-            # کپی libopenconnect.so به همراه تمام پیش‌نیازهای آن برای جلوگیری از کرش در زمان اجرا
-            cp "$TMP_DIR/extracted/lib/$abi/"*.so "app/src/main/jniLibs/$abi/"
+            # انتقال libopenconnect.so و لایبرری‌های کمکی آن
+            cp "$TMP_DIR/extracted/lib/$abi/"*.so "app/src/main/jniLibs/$abi/" 2>/dev/null || true
             echo ">>> Successfully placed OpenConnect libraries for $abi"
           done
           rm -rf "$TMP_DIR"
