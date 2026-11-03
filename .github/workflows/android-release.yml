@@ -15,7 +15,7 @@ on:
         default: play
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -58,7 +58,6 @@ jobs:
           (cd "$WORK_DIR" && ./scripts/fetch.sh)
           
           echo ">>> Patching psiphon-tls in build-zedcore.sh..."
-          # جایگزینی امن خط patch با دستور خنثی‌سازی panic در unsafe.go
           sed -i 's/patch -d "$PTLS_DIR".*/chmod -R u+w "$PTLS_DIR" \&\& sed -i "s\/panic(fmt.Sprintf(\\"tls: ConnectionState\/\\\/\\\/ panic(\/g" "$PTLS_DIR\/unsafe.go" || true/' "$WORK_DIR/scripts/build-zedcore.sh"
           
           echo ">>> Compiling zedcore.aar from source..."
@@ -240,8 +239,46 @@ jobs:
         if: always()
         run: shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
 
-      - uses: actions/upload-artifact@v4
+      # ----------------------------------------------------
+      # خروجی‌های تفکیک‌شده (هر فایل جداگانه و کم‌حجم)
+      # ----------------------------------------------------
+      - name: Upload arm64-v8a APK (مخصوص تمام گوشی‌های جدید - کم‌حجم)
+        uses: actions/upload-artifact@v4
         with:
-          name: "zedsecure-android-${{ steps.v.outputs.name }}-${{ steps.v.outputs.code }}"
-          path: dist/*
+          name: "ZedSecure-${{ steps.v.outputs.name }}-arm64-v8a"
+          path: dist/*-arm64-v8a.apk
           retention-days: 30
+
+      - name: Upload Universal APK (نسخه همه‌کاره برای تمام دستگاه‌ها)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ZedSecure-${{ steps.v.outputs.name }}-universal"
+          path: dist/*-universal.apk
+          retention-days: 30
+
+      - name: Upload Google Play Bundle (فایل مخصوص انتشار در گوگل‌پلی)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ZedSecure-${{ steps.v.outputs.name }}-GooglePlay-bundle"
+          path: dist/*.aab
+          retention-days: 30
+
+      - name: Upload other ABIs & Checksums (سایر معماری‌ها)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ZedSecure-${{ steps.v.outputs.name }}-other-abis"
+          path: |
+            dist/*-armeabi-v7a.apk
+            dist/*-x86_64.apk
+            dist/SHA256SUMS-android.txt
+          retention-days: 30
+
+      # انتشار مستقیم فایل‌های خام APK بدون زیپ در بخش Releases گیت‌هاب
+      - name: Publish Direct APKs to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${{ steps.v.outputs.name }}-b${{ steps.v.outputs.code }}"
+          echo ">>> Publishing direct APK downloads to Release: $TAG"
+          gh release create "$TAG" dist/* --title "ZedSecure v${{ steps.v.outputs.name }}" --notes "Official direct APK release" || gh release upload "$TAG" dist/* --clobber
