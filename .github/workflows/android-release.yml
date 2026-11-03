@@ -57,12 +57,9 @@ jobs:
           echo ">>> Fetching engine dependencies..."
           (cd "$WORK_DIR" && ./scripts/fetch.sh)
           
-          echo ">>> Patching psiphon-tls in build-zedcore.sh to fix the 18 vs 17 panic..."
-          # خنثی کردن هوشمند ارور panic فیلدهای TLS بدون نیاز به فایل پچ خارجی
+          echo ">>> Patching psiphon-tls in build-zedcore.sh..."
+          # جایگزینی امن خط patch با دستور خنثی‌سازی panic در unsafe.go
           sed -i 's/patch -d "$PTLS_DIR".*/chmod -R u+w "$PTLS_DIR" \&\& sed -i "s\/panic(fmt.Sprintf(\\"tls: ConnectionState\/\\\/\\\/ panic(\/g" "$PTLS_DIR\/unsafe.go" || true/' "$WORK_DIR/scripts/build-zedcore.sh"
-          
-          # همچنین اگر ماژول در کش دانلود شد، آن را هم پچ کن
-          sed -i 's/gomobile bind -v/go mod download\n  find "\$(go env GOPATH)\/pkg\/mod" -name "unsafe.go" -path "*psiphon-tls*" -exec chmod +w {} + -exec sed -i "s\/panic(fmt.Sprintf(\\"tls: ConnectionState\/\\\/\\\/ panic(\/g" {} +\n  gomobile bind -v/' "$WORK_DIR/scripts/build-zedcore.sh"
           
           echo ">>> Compiling zedcore.aar from source..."
           (cd "$WORK_DIR" && \
