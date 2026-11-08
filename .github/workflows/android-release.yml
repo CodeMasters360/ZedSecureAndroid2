@@ -4,126 +4,126 @@ on:
   workflow_dispatch:
     inputs:
       signing_key:
-        description: "play = the key Google Play already knows; upload = the CA key"
+        description: "play = the key Google Play already knows; upload = the CA upload key"
         type: choice
         default: play
         options: [play, upload]
   workflow_call:
     inputs:
       signing_key:
+        description: "play or upload"
         type: string
+        required: false
         default: play
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      KEY_PASSWORD:
+        required: false
+      PLAY_KEYSTORE_BASE64:
+        required: false
+      PLAY_KEYSTORE_PASSWORD:
+        required: false
+      PLAY_KEY_ALIAS:
+        required: false
+      PLAY_KEY_PASSWORD:
+        required: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 80
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "21" }
-      - uses: gradle/actions/setup-gradle@v3
-      - uses: actions/setup-go@v5
+      - name: Check out source
+        uses: actions/checkout@v7
         with:
-          go-version: "1.24"
-          cache: false
+          persist-credentials: false
 
-      - name: Read the version
-        id: v
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Read and validate version
+        id: version
+        shell: bash
         run: |
-          echo "name=$(grep '^zedsecure.versionName=' gradle.properties | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-          echo "code=$(grep '^zedsecure.versionCode=' gradle.properties | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          VERSION_NAME="$(sed -n 's/^zedsecure.versionName=//p' gradle.properties | head -n1)"
+          VERSION_CODE="$(sed -n 's/^zedsecure.versionCode=//p' gradle.properties | head -n1)"
+          [[ -n "$VERSION_NAME" ]] || { echo "::error::zedsecure.versionName is missing"; exit 1; }
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "::error::zedsecure.versionCode must be numeric"; exit 1; }
+          {
+            echo "name=$VERSION_NAME"
+            echo "code=$VERSION_CODE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ZedSecure $VERSION_NAME (versionCode $VERSION_CODE)"
 
-      - name: Take base engines
+      # Use the repository's pinned core releases and SHA-256 verification.
+      # Do not rebuild/overwrite zedcore.aar from a floating branch here.
+      - name: Fetch pinned Android engines
         run: ./tools/get-cores.sh android
 
-      # کامپایل هسته zedcore با پچ بدون کرش Psiphon-TLS
-      - name: Build fresh and patched zedcore.aar
+      - name: Validate native engine inputs
+        shell: bash
         run: |
-          set -e
-          echo ">>> Setting up Go tools for zedcore compilation..."
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
-          export PATH="$HOME/go/bin:$PATH"
-          gomobile init
-          
-          WORK_DIR="/tmp/cores-build"
-          mkdir -p "$WORK_DIR"
-          git clone --depth 1 https://github.com/CluvexStudio/ZedSecure-Cores.git "$WORK_DIR"
-          
-          (cd "$WORK_DIR" && ./scripts/fetch.sh)
-          
-          # خنثی‌سازی ارور panic در unsafe.go
-          sed -i 's/patch -d "$PTLS_DIR".*/chmod -R u+w "$PTLS_DIR" \&\& sed -i "s\/panic(fmt.Sprintf(\\"tls: ConnectionState\/\\\/\\\/ panic(\/g" "$PTLS_DIR\/unsafe.go" || true/' "$WORK_DIR/scripts/build-zedcore.sh"
-          
-          (cd "$WORK_DIR" && \
-            export ANDROID_HOME="$ANDROID_HOME" && \
-            export ANDROID_NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)" && \
-            ./scripts/build-zedcore.sh)
-          
-          mkdir -p app/libs
-          cp -f "$WORK_DIR/out/zedcore.aar" app/libs/zedcore.aar
-          echo ">>> Successfully placed patched zedcore.aar"
+          set -euo pipefail
+          test -s app/libs/zedcore.aar || { echo "::error::app/libs/zedcore.aar is missing"; exit 1; }
 
-      # اضافه کردن پیش‌نیازهای OpenConnect با پشتیبانی JNI
-      - name: Fetch prebuilt OpenConnect with JNI
-        run: |
-          set -e
-          TMP_DIR="/tmp/oc-download"
-          mkdir -p "$TMP_DIR"
-          
-          curl -fsSL --retry 3 -o "$TMP_DIR/openconnect.apk" "https://f-droid.org/repo/net.openconnect_vpn.android_1120.apk"
-          unzip -q -o "$TMP_DIR/openconnect.apk" "lib/*" -d "$TMP_DIR/extracted"
-          
-          mkdir -p "app/src/main/jniLibs/arm64-v8a" "app/src/main/jniLibs/x86_64" "app/src/main/jniLibs/armeabi-v7a"
-          
-          cp "$TMP_DIR/extracted/lib/arm64-v8a/"*.so "app/src/main/jniLibs/arm64-v8a/"
-          cp "$TMP_DIR/extracted/lib/x86_64/"*.so "app/src/main/jniLibs/x86_64/"
-          cp "$TMP_DIR/extracted/lib/armeabi/"*.so "app/src/main/jniLibs/armeabi-v7a/"
-          rm -rf "$TMP_DIR"
-
-      # فعال‌سازی ساخت فابریک فایل‌های تفکیک‌شده در گریدل (طبق معماری بیلدر اصلی)
-      - name: Configure Gradle for native splits
-        run: |
-          cat >> app/build.gradle.kts <<'EOF'
-          android {
-              splits {
-                  abi {
-                      isEnable = true
-                      reset()
-                      include("arm64-v8a", "armeabi-v7a", "x86_64")
-                      isUniversalApk = false
-                  }
-              }
-          }
-          EOF
-
-      - name: Check the engines
-        run: |
-          set -e
-          ls -l app/libs/zedcore.aar
           for abi in arm64-v8a armeabi-v7a x86_64; do
+            abi_dir="app/src/main/jniLibs/$abi"
+            mkdir -p "$abi_dir"
+
             for lib in libtor libobfs4proxy libsnowflake libconjure libsnispoof libhev-socks5-tunnel libopenconnect libzeptun-jni; do
-              [ -f "app/src/main/jniLibs/$abi/$lib.so" ] || echo "::warning::$abi/$lib.so is missing; that protocol will not work"
+              if [[ ! -f "$abi_dir/$lib.so" ]]; then
+                echo "::warning::$abi/$lib.so is missing; that optional engine may not be available for this ABI"
+              fi
             done
+
             for lib in libhev-socks5-tunnel libopenconnect libzeptun-jni; do
-              so="app/src/main/jniLibs/$abi/$lib.so"
-              [ -f "$so" ] || continue
-              readelf --dyn-syms -W "$so" | grep -qE ' (JNI_OnLoad|Java_)' || { echo "::error::$abi/$lib.so has no JNI entry points; the app would crash loading it"; exit 1; }
+              so="$abi_dir/$lib.so"
+              [[ -f "$so" ]] || continue
+              if ! readelf --dyn-syms -W "$so" | grep -qE ' (JNI_OnLoad|Java_)'; then
+                echo "::error::$so has no JNI entry points"
+                exit 1
+              fi
             done
-            for so in app/src/main/jniLibs/$abi/*.so; do
-              case "$so" in */libzeptun*) continue ;; esac
-              if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then echo "::error::$so uses RELR relocations, which Android 7 and 8 cannot load"; exit 1; fi
+
+            for so in "$abi_dir"/*.so; do
+              [[ -f "$so" ]] || continue
+              case "$so" in
+                */libzeptun*) continue ;;
+              esac
+              if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then
+                echo "::error::$so uses RELR relocations, which are incompatible with Android 7/8"
+                exit 1
+              fi
             done
           done
-          find app/src/main/jniLibs -name '*.so' | sort
 
-      - name: Unlock signing
+          echo "Native libraries found:"
+          find app/src/main/jniLibs -type f -name '*.so' -print | sort
+
+      - name: Configure release signing
+        shell: bash
         env:
-          USE_PLAY: ${{ inputs.signing_key != 'upload' }}
+          SIGNING_KEY: ${{ inputs.signing_key }}
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -133,93 +133,274 @@ jobs:
           PLAY_KEY_ALIAS: ${{ secrets.PLAY_KEY_ALIAS }}
           PLAY_KEY_PASSWORD: ${{ secrets.PLAY_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           umask 077
-          if [ "$USE_PLAY" = "true" ]; then
-            echo "$PLAY_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > release.keystore
-            STORE_PW="$PLAY_KEYSTORE_PASSWORD"; KEY_PW="$PLAY_KEY_PASSWORD"; ALIAS="$PLAY_KEY_ALIAS"
-          else
-            echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > release.keystore
-            STORE_PW="$KEYSTORE_PASSWORD"; KEY_PW="$KEY_PASSWORD"; ALIAS="$KEY_ALIAS"
-          fi
-          { echo "storeFile=release.keystore"; echo "storePassword=$STORE_PW"
-            echo "keyPassword=$KEY_PW"; echo "keyAlias=$ALIAS"; } > keystore.properties
 
-      # ساخت بیلد فابریک گریدل دقیقاً مانند بیلدر اصلی
-      - name: Build
-        run: ./gradlew --warning-mode all :app:assembleRelease
+          case "$SIGNING_KEY" in
+            play)
+              ENCODED_KEYSTORE="${PLAY_KEYSTORE_BASE64:?Missing PLAY_KEYSTORE_BASE64}"
+              STORE_PASSWORD="${PLAY_KEYSTORE_PASSWORD:?Missing PLAY_KEYSTORE_PASSWORD}"
+              ALIAS="${PLAY_KEY_ALIAS:?Missing PLAY_KEY_ALIAS}"
+              KEY_PASSWORD_VALUE="${PLAY_KEY_PASSWORD:?Missing PLAY_KEY_PASSWORD}"
+              ;;
+            upload)
+              ENCODED_KEYSTORE="${KEYSTORE_BASE64:?Missing KEYSTORE_BASE64}"
+              STORE_PASSWORD="${KEYSTORE_PASSWORD:?Missing KEYSTORE_PASSWORD}"
+              ALIAS="${KEY_ALIAS:?Missing KEY_ALIAS}"
+              KEY_PASSWORD_VALUE="${KEY_PASSWORD:?Missing KEY_PASSWORD}"
+              ;;
+            *)
+              echo "::error::signing_key must be 'play' or 'upload'"
+              exit 1
+              ;;
+          esac
 
-      # پکیجینگ و ادغام با اسکریپت فابریک universal-apk.py دقیقاً طبق منطق سازنده اصلی
-      - name: Name them for people (Original Logic)
+          printf '%s' "$ENCODED_KEYSTORE" | tr -d '[:space:]' | base64 --decode > release.keystore
+          test -s release.keystore || { echo "::error::Decoded keystore is empty"; exit 1; }
+
+          export ZED_STORE_PASSWORD="$STORE_PASSWORD"
+          export ZED_KEY_PASSWORD="$KEY_PASSWORD_VALUE"
+          export ZED_KEY_ALIAS="$ALIAS"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          def escape_property(value: str) -> str:
+              replacements = {
+                  "\\": "\\\\", "\t": "\\t", "\n": "\\n",
+                  "\r": "\\r", "\f": "\\f",
+              }
+              result = []
+              for index, char in enumerate(value):
+                  if char in replacements:
+                      result.append(replacements[char])
+                  elif char in " =:#!" and (index == 0 or char != " "):
+                      result.append("\\" + char)
+                  elif char == " " and index == 0:
+                      result.append("\\ ")
+                  else:
+                      result.append(char)
+              return "".join(result)
+
+          properties = {
+              "storeFile": "release.keystore",
+              "storePassword": os.environ["ZED_STORE_PASSWORD"],
+              "keyPassword": os.environ["ZED_KEY_PASSWORD"],
+              "keyAlias": os.environ["ZED_KEY_ALIAS"],
+          }
+          Path("keystore.properties").write_text(
+              "".join(f"{key}={escape_property(value)}\n" for key, value in properties.items()),
+              encoding="utf-8",
+          )
+          Path("keystore.properties").chmod(0o600)
+          PY
+
+      # Keep this invocation separate from bundleRelease. app/build.gradle.kts
+      # enables ABI splits when the requested task is NOT a bundle task.
+      - name: Build split APKs
+        run: ./gradlew --no-daemon --warning-mode all :app:assembleRelease
+
+      - name: Package and verify APKs
+        id: apk
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ inputs.signing_key }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          PLAY_KEYSTORE_PASSWORD: ${{ secrets.PLAY_KEYSTORE_PASSWORD }}
+          PLAY_KEY_ALIAS: ${{ secrets.PLAY_KEY_ALIAS }}
+          PLAY_KEY_PASSWORD: ${{ secrets.PLAY_KEY_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.name }}'
           mkdir -p dist
-          V='${{ steps.v.outputs.name }}'
-          
-          # کپی فایل‌های اصلی تفکیک‌شده که مستقیماً توسط گریدل بیلد شده‌اند
+
           for abi in arm64-v8a armeabi-v7a x86_64; do
             src="app/build/outputs/apk/release/app-$abi-release.apk"
-            [ -f "$src" ] || { echo "::error::$src was not built"; exit 1; }
-            cp "$src" "dist/ZedSecure-$V-$abi.apk"
+            [[ -s "$src" ]] || { echo "::error::Missing split APK: $src"; exit 1; }
+            cp "$src" "dist/ZedSecure-$VERSION-$abi.apk"
           done
-          
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          
-          # اجرای اسکریپت اصلی سازنده برای ساخت بدون نقصِ universal.apk
-          python3 tools/universal-apk.py "dist/ZedSecure-$V-arm64-v8a.apk" /tmp/universal.apk "dist/ZedSecure-$V-armeabi-v7a.apk"
-          "$BT/zipalign" -f -P 16 4 /tmp/universal.apk /tmp/universal-aligned.apk
-          
-          STORE_PW=$(grep '^storePassword=' keystore.properties | cut -d= -f2-)
-          KEY_PW=$(grep '^keyPassword=' keystore.properties | cut -d= -f2-)
-          KEY_ALIAS=$(grep '^keyAlias=' keystore.properties | cut -d= -f2-)
-          
-          "$BT/apksigner" sign --ks release.keystore \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass "pass:$STORE_PW" --key-pass "pass:$KEY_PW" \
-            --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
-            --out "dist/ZedSecure-$V-universal.apk" /tmp/universal-aligned.apk
-          rm -f /tmp/universal.apk /tmp/universal-aligned.apk
-          
-          for apk in dist/ZedSecure-*.apk; do
+
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          [[ -x "$BT/apksigner" && -x "$BT/zipalign" && -x "$BT/aapt2" ]] || {
+            echo "::error::Android build-tools are incomplete: $BT"
+            exit 1
+          }
+
+          # The project's official helper merges the two ARM APKs. x86_64 stays separate.
+          python3 tools/universal-apk.py \
+            "dist/ZedSecure-$VERSION-arm64-v8a.apk" \
+            /tmp/zedsecure-universal.apk \
+            "dist/ZedSecure-$VERSION-armeabi-v7a.apk"
+          "$BT/zipalign" -f -P 16 4 /tmp/zedsecure-universal.apk /tmp/zedsecure-universal-aligned.apk
+
+          case "$SIGNING_KEY" in
+            play)
+              STORE_PW="${PLAY_KEYSTORE_PASSWORD:?Missing PLAY_KEYSTORE_PASSWORD}"
+              KEY_PW="${PLAY_KEY_PASSWORD:?Missing PLAY_KEY_PASSWORD}"
+              KEY_ALIAS_VALUE="${PLAY_KEY_ALIAS:?Missing PLAY_KEY_ALIAS}"
+              ;;
+            upload)
+              STORE_PW="${KEYSTORE_PASSWORD:?Missing KEYSTORE_PASSWORD}"
+              KEY_PW="${KEY_PASSWORD:?Missing KEY_PASSWORD}"
+              KEY_ALIAS_VALUE="${KEY_ALIAS:?Missing KEY_ALIAS}"
+              ;;
+            *)
+              echo "::error::signing_key must be 'play' or 'upload'"
+              exit 1
+              ;;
+          esac
+          export STORE_PW KEY_PW
+          "$BT/apksigner" sign \
+            --ks release.keystore \
+            --ks-key-alias "$KEY_ALIAS_VALUE" \
+            --ks-pass env:STORE_PW \
+            --key-pass env:KEY_PW \
+            --v1-signing-enabled false \
+            --v2-signing-enabled true \
+            --v3-signing-enabled false \
+            --v4-signing-enabled false \
+            --out "dist/ZedSecure-$VERSION-universal.apk" \
+            /tmp/zedsecure-universal-aligned.apk
+          rm -f /tmp/zedsecure-universal.apk /tmp/zedsecure-universal-aligned.apk
+
+          REFERENCE_CERT=""
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            apk="dist/ZedSecure-$VERSION-$abi.apk"
             "$BT/apksigner" verify "$apk"
+            "$BT/zipalign" -c -P 16 4 "$apk"
+
+            BADGING="$("$BT/aapt2" dump badging "$apk")"
+            grep -Fq "versionName='$VERSION'" <<< "$BADGING" || {
+              echo "::error::$apk has an unexpected versionName"
+              exit 1
+            }
+            grep -Fq "native-code: '$abi'" <<< "$BADGING" || {
+              echo "::error::$apk does not contain the expected ABI ($abi)"
+              exit 1
+            }
+
+            CERT="$("$BT/apksigner" verify --print-certs "$apk" | grep -m1 'SHA-256' | awk '{print $NF}')"
+            [[ -n "$CERT" ]] || { echo "::error::Could not read signer certificate for $apk"; exit 1; }
+            if [[ -z "$REFERENCE_CERT" ]]; then
+              REFERENCE_CERT="$CERT"
+            elif [[ "$CERT" != "$REFERENCE_CERT" ]]; then
+              echo "::error::$apk is signed with a different certificate"
+              exit 1
+            fi
           done
-          
-          ( cd dist && sha256sum ZedSecure-*.apk > SHA256SUMS-android.txt )
+
+          UNIVERSAL="dist/ZedSecure-$VERSION-universal.apk"
+          "$BT/apksigner" verify "$UNIVERSAL"
+          "$BT/zipalign" -c -P 16 4 "$UNIVERSAL"
+          UNIVERSAL_BADGING="$("$BT/aapt2" dump badging "$UNIVERSAL")"
+          grep -Fq "native-code: 'arm64-v8a' 'armeabi-v7a'" <<< "$UNIVERSAL_BADGING" || {
+            echo "::error::Universal APK does not contain both ARM ABIs"
+            exit 1
+          }
+          UNIVERSAL_CERT="$("$BT/apksigner" verify --print-certs "$UNIVERSAL" | grep -m1 'SHA-256' | awk '{print $NF}')"
+          [[ "$UNIVERSAL_CERT" == "$REFERENCE_CERT" ]] || {
+            echo "::error::Universal APK signer does not match the split APKs"
+            exit 1
+          }
+
+          echo "Verified APKs:"
+          ls -lh dist/*.apk
+
+      # Run bundleRelease in a distinct Gradle invocation. The app's Gradle script
+      # detects the bundle task and intentionally disables APK ABI splits for AAB.
+      - name: Build Google Play App Bundle
+        run: ./gradlew --no-daemon --warning-mode all :app:bundleRelease
+
+      - name: Package and verify AAB and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.name }}'
+          VERSION_CODE='${{ steps.version.outputs.code }}'
+          AAB_SOURCE="app/build/outputs/bundle/release/app-release.aab"
+          [[ -s "$AAB_SOURCE" ]] || { echo "::error::Missing AAB: $AAB_SOURCE"; exit 1; }
+
+          AAB="dist/ZedSecure-$VERSION.aab"
+          cp "$AAB_SOURCE" "$AAB"
+          unzip -t "$AAB" >/dev/null
+          AAB_ENTRIES="$(unzip -Z1 "$AAB")"
+
+          grep -Fxq 'base/manifest/AndroidManifest.xml' <<< "$AAB_ENTRIES" || {
+            echo "::error::AAB is missing the base manifest"
+            exit 1
+          }
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            if ! grep -Eq "^base/lib/$abi/[^/]+\.so$" <<< "$AAB_ENTRIES"; then
+              echo "::error::AAB has no native libraries for $abi"
+              exit 1
+            fi
+          done
+
+          ( cd dist && sha256sum ZedSecure-* > SHA256SUMS-android.txt )
+          echo "AAB native libraries:"
+          grep -E '^base/lib/(arm64-v8a|armeabi-v7a|x86_64)/.*\.so$' <<< "$AAB_ENTRIES" | sort
+          echo "Release files:"
           ls -lh dist
+          echo "SHA-256 checksums:"
+          cat dist/SHA256SUMS-android.txt
 
-      - name: Forget the key
+      - name: Remove signing material
         if: always()
-        run: shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
+        shell: bash
+        run: |
+          shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
 
-      # آپلود جداگانه هر پکیج به صورت سبک
-      - name: Upload arm64-v8a APK (سبک و فابریک برای گوشی‌های جدید)
-        uses: actions/upload-artifact@v4
+      - name: Upload arm64-v8a APK
+        uses: actions/upload-artifact@v7
         with:
-          name: "ZedSecure-${{ steps.v.outputs.name }}-arm64-v8a"
-          path: dist/*-arm64-v8a.apk
+          name: ZedSecure-${{ steps.version.outputs.name }}-arm64-v8a
+          path: dist/ZedSecure-${{ steps.version.outputs.name }}-arm64-v8a.apk
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Universal APK (نسخه کامل ساخته شده با universal-apk.py)
-        uses: actions/upload-artifact@v4
+      - name: Upload Universal APK
+        uses: actions/upload-artifact@v7
         with:
-          name: "ZedSecure-${{ steps.v.outputs.name }}-universal"
-          path: dist/*-universal.apk
+          name: ZedSecure-${{ steps.version.outputs.name }}-universal
+          path: dist/ZedSecure-${{ steps.version.outputs.name }}-universal.apk
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload other ABIs
-        uses: actions/upload-artifact@v4
+      - name: Upload Google Play AAB
+        uses: actions/upload-artifact@v7
         with:
-          name: "ZedSecure-${{ steps.v.outputs.name }}-other-abis"
+          name: ZedSecure-${{ steps.version.outputs.name }}-GooglePlay-bundle
+          path: dist/ZedSecure-${{ steps.version.outputs.name }}.aab
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload other ABIs and checksums
+        uses: actions/upload-artifact@v7
+        with:
+          name: ZedSecure-${{ steps.version.outputs.name }}-other-abis
           path: |
-            dist/*-armeabi-v7a.apk
-            dist/*-x86_64.apk
+            dist/ZedSecure-${{ steps.version.outputs.name }}-armeabi-v7a.apk
+            dist/ZedSecure-${{ steps.version.outputs.name }}-x86_64.apk
             dist/SHA256SUMS-android.txt
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Publish Direct APKs to GitHub Releases
+      - name: Publish APKs, AAB and checksums to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          set -e
-          TAG="v${{ steps.v.outputs.name }}-b${{ steps.v.outputs.code }}"
-          echo ">>> Publishing direct APK downloads to Release: $TAG"
-          gh release create "$TAG" dist/* --title "ZedSecure v${{ steps.v.outputs.name }}" --notes "Official direct APK release" || gh release upload "$TAG" dist/* --clobber
+          set -euo pipefail
+          TAG="v${{ steps.version.outputs.name }}-b${{ steps.version.outputs.code }}"
+          echo "Publishing ZedSecure ${{ steps.version.outputs.name }} as $TAG"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "ZedSecure v${{ steps.version.outputs.name }}" \
+              --notes "Android release: split APKs, ARM universal APK, Google Play AAB and SHA-256 checksums."
+          fi
