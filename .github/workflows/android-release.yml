@@ -40,7 +40,8 @@ jobs:
       - name: Take base engines
         run: ./tools/get-cores.sh android
 
-      - name: Build fresh and patched zedcore.aar (Fixes Psiphon-TLS Crash)
+      # کامپایل هسته zedcore با پچ بدون کرش Psiphon-TLS
+      - name: Build fresh and patched zedcore.aar
         run: |
           set -e
           echo ">>> Setting up Go tools for zedcore compilation..."
@@ -51,16 +52,13 @@ jobs:
           
           WORK_DIR="/tmp/cores-build"
           mkdir -p "$WORK_DIR"
-          echo ">>> Cloning Cores source..."
           git clone --depth 1 https://github.com/CluvexStudio/ZedSecure-Cores.git "$WORK_DIR"
           
-          echo ">>> Fetching engine dependencies..."
           (cd "$WORK_DIR" && ./scripts/fetch.sh)
           
-          echo ">>> Patching psiphon-tls in build-zedcore.sh..."
+          # خنثی‌سازی ارور panic در unsafe.go
           sed -i 's/patch -d "$PTLS_DIR".*/chmod -R u+w "$PTLS_DIR" \&\& sed -i "s\/panic(fmt.Sprintf(\\"tls: ConnectionState\/\\\/\\\/ panic(\/g" "$PTLS_DIR\/unsafe.go" || true/' "$WORK_DIR/scripts/build-zedcore.sh"
           
-          echo ">>> Compiling zedcore.aar from source..."
           (cd "$WORK_DIR" && \
             export ANDROID_HOME="$ANDROID_HOME" && \
             export ANDROID_NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)" && \
@@ -68,12 +66,12 @@ jobs:
           
           mkdir -p app/libs
           cp -f "$WORK_DIR/out/zedcore.aar" app/libs/zedcore.aar
-          echo ">>> Successfully replaced zedcore.aar with the patched crash-free build!"
+          echo ">>> Successfully placed patched zedcore.aar"
 
+      # اضافه کردن پیش‌نیازهای OpenConnect با پشتیبانی JNI
       - name: Fetch prebuilt OpenConnect with JNI
         run: |
           set -e
-          echo ">>> Fetching official OpenConnect Android binaries..."
           TMP_DIR="/tmp/oc-download"
           mkdir -p "$TMP_DIR"
           
@@ -85,24 +83,21 @@ jobs:
           cp "$TMP_DIR/extracted/lib/arm64-v8a/"*.so "app/src/main/jniLibs/arm64-v8a/"
           cp "$TMP_DIR/extracted/lib/x86_64/"*.so "app/src/main/jniLibs/x86_64/"
           cp "$TMP_DIR/extracted/lib/armeabi/"*.so "app/src/main/jniLibs/armeabi-v7a/"
-          
-          echo ">>> Placed OpenConnect libraries:"
-          ls -lh app/src/main/jniLibs/*/libopenconnect.so
           rm -rf "$TMP_DIR"
 
-      - name: Inject ProGuard rules for Go and Core engines
+      # فعال‌سازی ساخت فابریک فایل‌های تفکیک‌شده در گریدل (طبق معماری بیلدر اصلی)
+      - name: Configure Gradle for native splits
         run: |
-          cat >> app/proguard-rules.pro <<'EOF'
-          -keep class go.** { *; }
-          -keep class libbox.** { *; }
-          -keep class libv2ray.** { *; }
-          -keep class psi.** { *; }
-          -keep class ca.psiphon.** { *; }
-          -keep class zeddns.** { *; }
-          -keep class masterdnsvpn.** { *; }
-          -keep class dev.cluvex.zedsecure.core.** { *; }
-          -keepclasseswithmembernames class * {
-              native <methods>;
+          cat >> app/build.gradle.kts <<'EOF'
+          android {
+              splits {
+                  abi {
+                      isEnable = true
+                      reset()
+                      include("arm64-v8a", "armeabi-v7a", "x86_64")
+                      isUniversalApk = false
+                  }
+              }
           }
           EOF
 
@@ -149,121 +144,68 @@ jobs:
           { echo "storeFile=release.keystore"; echo "storePassword=$STORE_PW"
             echo "keyPassword=$KEY_PW"; echo "keyAlias=$ALIAS"; } > keystore.properties
 
-      - name: Build APKs and Bundle (AAB)
-        run: ./gradlew --warning-mode all :app:assembleRelease :app:bundleRelease
+      # ساخت بیلد فابریک گریدل دقیقاً مانند بیلدر اصلی
+      - name: Build
+        run: ./gradlew --warning-mode all :app:assembleRelease
 
-      - name: Package and Verify Everything
+      # پکیجینگ و ادغام با اسکریپت فابریک universal-apk.py دقیقاً طبق منطق سازنده اصلی
+      - name: Name them for people (Original Logic)
         run: |
           set -e
           mkdir -p dist
           V='${{ steps.v.outputs.name }}'
+          
+          # کپی فایل‌های اصلی تفکیک‌شده که مستقیماً توسط گریدل بیلد شده‌اند
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            src="app/build/outputs/apk/release/app-$abi-release.apk"
+            [ -f "$src" ] || { echo "::error::$src was not built"; exit 1; }
+            cp "$src" "dist/ZedSecure-$V-$abi.apk"
+          done
+          
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          
+          # اجرای اسکریپت اصلی سازنده برای ساخت بدون نقصِ universal.apk
+          python3 tools/universal-apk.py "dist/ZedSecure-$V-arm64-v8a.apk" /tmp/universal.apk "dist/ZedSecure-$V-armeabi-v7a.apk"
+          "$BT/zipalign" -f -P 16 4 /tmp/universal.apk /tmp/universal-aligned.apk
           
           STORE_PW=$(grep '^storePassword=' keystore.properties | cut -d= -f2-)
           KEY_PW=$(grep '^keyPassword=' keystore.properties | cut -d= -f2-)
           KEY_ALIAS=$(grep '^keyAlias=' keystore.properties | cut -d= -f2-)
           
-          echo ">>> Locating generated APKs..."
-          find app/build/outputs/apk -type f -name "*.apk"
+          "$BT/apksigner" sign --ks release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$STORE_PW" --key-pass "pass:$KEY_PW" \
+            --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
+            --out "dist/ZedSecure-$V-universal.apk" /tmp/universal-aligned.apk
+          rm -f /tmp/universal.apk /tmp/universal-aligned.apk
           
-          HAS_SPLITS=true
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            if [ ! -f "app/build/outputs/apk/release/app-$abi-release.apk" ] && [ ! -f "app/build/outputs/apk/release/app-$abi-release-unsigned.apk" ]; then
-              HAS_SPLITS=false
-            fi
-          done
-          
-          if [ "$HAS_SPLITS" = "true" ]; then
-            echo ">>> Split APKs found. Processing..."
-            for abi in arm64-v8a armeabi-v7a x86_64; do
-              src=$(ls app/build/outputs/apk/release/app-$abi-*.apk | head -1)
-              cp "$src" "dist/ZedSecure-$V-$abi.apk"
-            done
-            python3 tools/universal-apk.py "dist/ZedSecure-$V-arm64-v8a.apk" /tmp/universal.apk "dist/ZedSecure-$V-armeabi-v7a.apk"
-            "$BT/zipalign" -f -P 16 4 /tmp/universal.apk /tmp/universal-aligned.apk
-            "$BT/apksigner" sign --ks release.keystore --ks-key-alias "$KEY_ALIAS" \
-              --ks-pass "pass:$STORE_PW" --key-pass "pass:$KEY_PW" \
-              --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
-              --out "dist/ZedSecure-$V-universal.apk" /tmp/universal-aligned.apk
-            rm -f /tmp/universal.apk /tmp/universal-aligned.apk
-          else
-            echo ">>> Single Universal APK generated. Creating split and universal packages..."
-            base_apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
-            
-            "$BT/zipalign" -f -P 16 4 "$base_apk" /tmp/uni-aligned.apk
-            "$BT/apksigner" sign --ks release.keystore --ks-key-alias "$KEY_ALIAS" \
-              --ks-pass "pass:$STORE_PW" --key-pass "pass:$KEY_PW" \
-              --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
-              --out "dist/ZedSecure-$V-universal.apk" /tmp/uni-aligned.apk
-            rm -f /tmp/uni-aligned.apk
-            
-            for abi in arm64-v8a armeabi-v7a x86_64; do
-              target="dist/ZedSecure-$V-$abi.apk"
-              cp "$base_apk" /tmp/split.apk
-              
-              case "$abi" in
-                arm64-v8a)   zip -d /tmp/split.apk "lib/armeabi-v7a/*" "lib/x86_64/*" "lib/x86/*" 2>/dev/null || true ;;
-                armeabi-v7a) zip -d /tmp/split.apk "lib/arm64-v8a/*" "lib/x86_64/*" "lib/x86/*" 2>/dev/null || true ;;
-                x86_64)      zip -d /tmp/split.apk "lib/arm64-v8a/*" "lib/armeabi-v7a/*" "lib/x86/*" 2>/dev/null || true ;;
-              esac
-              
-              "$BT/zipalign" -f -P 16 4 /tmp/split.apk /tmp/split-aligned.apk
-              "$BT/apksigner" sign --ks release.keystore --ks-key-alias "$KEY_ALIAS" \
-                --ks-pass "pass:$STORE_PW" --key-pass "pass:$KEY_PW" \
-                --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
-                --out "$target" /tmp/split-aligned.apk
-              rm -f /tmp/split.apk /tmp/split-aligned.apk
-            done
-          fi
-
           for apk in dist/ZedSecure-*.apk; do
             "$BT/apksigner" verify "$apk"
           done
           
-          # --- پردازش و آماده‌سازی AAB (باندل گوگل‌پلی) ---
-          aab_src="app/build/outputs/bundle/release/app-release.aab"
-          [ -f "$aab_src" ] || { echo "::error::$aab_src was not built"; exit 1; }
-          cp "$aab_src" "dist/ZedSecure-$V.aab"
-          
-          unzip -l "dist/ZedSecure-$V.aab" | awk '/base\/lib\//{print $4}' | sort > libs.txt
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            for lib in libgojni libtor libobfs4proxy libconjure libsnowflake libsnispoof libhev-socks5-tunnel libopenconnect libzeptun libzeptun-jni; do
-              grep -qx "base/lib/$abi/$lib.so" libs.txt || { echo "::error::$abi/$lib.so is not in the bundle"; exit 1; }
-            done
-          done
-          
-          ( cd dist && sha256sum ZedSecure-* > SHA256SUMS-android.txt )
+          ( cd dist && sha256sum ZedSecure-*.apk > SHA256SUMS-android.txt )
           ls -lh dist
 
       - name: Forget the key
         if: always()
         run: shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
 
-      # ----------------------------------------------------
-      # خروجی‌های تفکیک‌شده (هر فایل جداگانه و کم‌حجم)
-      # ----------------------------------------------------
-      - name: Upload arm64-v8a APK (مخصوص تمام گوشی‌های جدید - کم‌حجم)
+      # آپلود جداگانه هر پکیج به صورت سبک
+      - name: Upload arm64-v8a APK (سبک و فابریک برای گوشی‌های جدید)
         uses: actions/upload-artifact@v4
         with:
           name: "ZedSecure-${{ steps.v.outputs.name }}-arm64-v8a"
           path: dist/*-arm64-v8a.apk
           retention-days: 30
 
-      - name: Upload Universal APK (نسخه همه‌کاره برای تمام دستگاه‌ها)
+      - name: Upload Universal APK (نسخه کامل ساخته شده با universal-apk.py)
         uses: actions/upload-artifact@v4
         with:
           name: "ZedSecure-${{ steps.v.outputs.name }}-universal"
           path: dist/*-universal.apk
           retention-days: 30
 
-      - name: Upload Google Play Bundle (فایل مخصوص انتشار در گوگل‌پلی)
-        uses: actions/upload-artifact@v4
-        with:
-          name: "ZedSecure-${{ steps.v.outputs.name }}-GooglePlay-bundle"
-          path: dist/*.aab
-          retention-days: 30
-
-      - name: Upload other ABIs & Checksums (سایر معماری‌ها)
+      - name: Upload other ABIs
         uses: actions/upload-artifact@v4
         with:
           name: "ZedSecure-${{ steps.v.outputs.name }}-other-abis"
@@ -273,7 +215,6 @@ jobs:
             dist/SHA256SUMS-android.txt
           retention-days: 30
 
-      # انتشار مستقیم فایل‌های خام APK بدون زیپ در بخش Releases گیت‌هاب
       - name: Publish Direct APKs to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
