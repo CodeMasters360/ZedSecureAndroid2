@@ -8,6 +8,10 @@ on:
         type: choice
         default: play
         options: [play, upload]
+      core_ref:
+        description: "ZedSecure-Cores tag/ref to build (default: zedcore-r6)"
+        type: string
+        default: zedcore-r6
   workflow_call:
     inputs:
       signing_key:
@@ -15,6 +19,11 @@ on:
         type: string
         required: false
         default: play
+      core_ref:
+        description: "ZedSecure-Cores tag/ref; use a tag or commit SHA"
+        type: string
+        required: false
+        default: zedcore-r6
     secrets:
       KEYSTORE_BASE64:
         required: false
@@ -43,7 +52,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 80
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -56,6 +65,38 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 17 SDK and pinned NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [[ -n "$SDK_ROOT" ]] || { echo "::error::ANDROID_HOME/ANDROID_SDK_ROOT is not set"; exit 1; }
+          set +o pipefail
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "platform-tools" \
+            "ndk;28.2.13676358"
+          {
+            echo "ANDROID_HOME=$SDK_ROOT"
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+            echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/28.2.13676358"
+            echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/28.2.13676358"
+          } >> "$GITHUB_ENV"
+          test -x "$SDK_ROOT/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          test -f "$SDK_ROOT/platforms/android-37.0/android.jar"
+
+      - name: Set up Go for zedcore
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.3"
+          cache: false
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v5
@@ -75,10 +116,120 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Building ZedSecure $VERSION_NAME (versionCode $VERSION_CODE)"
 
-      # Use the repository's pinned core releases and SHA-256 verification.
-      # Do not rebuild/overwrite zedcore.aar from a floating branch here.
-      - name: Fetch pinned Android engines
-        run: ./tools/get-cores.sh android
+      # Use the project's own checksum-verifying downloader for the native
+      # engines, but skip its prebuilt zedcore.aar asset: zedcore is compiled below.
+      - name: Fetch pinned Android native engines (without prebuilt zedcore)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          source = Path("tools/get-cores.sh").read_text(encoding="utf-8")
+          needle = '    cp "$(fetch zedcore zedcore.aar)" "$ROOT/app/libs/zedcore.aar"\n'
+          if source.count(needle) != 1:
+              raise SystemExit("get-cores.sh changed; refusing to guess how to skip its prebuilt zedcore.aar download")
+          target = Path("tools/.get-cores-native-only.sh")
+          target.write_text(
+              source.replace(needle, "    # zedcore.aar is built from source in the next workflow step.\n"),
+              encoding="utf-8",
+          )
+          target.chmod(0o755)
+          PY
+          trap 'rm -f tools/.get-cores-native-only.sh' EXIT
+          ./tools/.get-cores-native-only.sh android
+
+      # Build zedcore.aar from the matching ZedSecure-Cores source tag. The
+      # upstream script pins all source dependencies and applies the official
+      # Psiphon TLS compatibility patch; do not edit that script or suppress panic.
+      - name: Build zedcore.aar from source
+        id: core
+        shell: bash
+        env:
+          CORES_REF: ${{ inputs.core_ref }}
+          GOTOOLCHAIN: go1.27.3
+        run: |
+          set -euo pipefail
+          CORE_REF="${CORES_REF:-zedcore-r6}"
+          CORE_DIR="$RUNNER_TEMP/ZedSecure-Cores"
+          rm -rf "$CORE_DIR"
+
+          git init "$CORE_DIR"
+          git -C "$CORE_DIR" remote add origin https://github.com/CluvexStudio/ZedSecure-Cores.git
+          git -C "$CORE_DIR" fetch --no-tags --depth=1 origin "$CORE_REF"
+          git -C "$CORE_DIR" checkout --detach FETCH_HEAD
+          CORE_COMMIT="$(git -C "$CORE_DIR" rev-parse HEAD)"
+          echo "ZedSecure-Cores ref: $CORE_REF"
+          echo "ZedSecure-Cores commit: $CORE_COMMIT"
+
+          test -s "$CORE_DIR/scripts/fetch.sh"
+          test -s "$CORE_DIR/scripts/build-zedcore.sh"
+          test -s "$CORE_DIR/patches/psiphon-tls-go1.27.patch"
+
+          echo ">>> Fetching exact dependency commits from pins.txt"
+          (cd "$CORE_DIR" && ./scripts/fetch.sh)
+
+          echo ">>> Installing gomobile with Go 1.27.3"
+          export PATH="$HOME/go/bin:$PATH"
+          go version
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          command -v gomobile
+          gomobile init
+
+          # Fail closed if a stale/prebuilt AAR exists in the checkout.
+          rm -f app/libs/zedcore.aar
+
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          export JAVA_HOME="$JAVA_HOME"
+          export TARGETS="android/arm64,android/arm,android/amd64"
+          export PATH="$HOME/go/bin:$JAVA_HOME/bin:$PATH"
+          (cd "$CORE_DIR" && ./scripts/build-zedcore.sh)
+
+          BUILT_AAR="$CORE_DIR/out/zedcore.aar"
+          [[ -s "$BUILT_AAR" ]] || { echo "::error::Source build did not produce zedcore.aar"; exit 1; }
+          mkdir -p app/libs
+          install -m 0644 "$BUILT_AAR" app/libs/zedcore.aar
+          unzip -tq app/libs/zedcore.aar
+
+          AAR_ENTRIES="$(unzip -Z1 app/libs/zedcore.aar)"
+          grep -Fxq 'classes.jar' <<< "$AAR_ENTRIES" || { echo "::error::Built AAR has no classes.jar"; exit 1; }
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            grep -Eq "^jni/$abi/[^/]+\.so$" <<< "$AAR_ENTRIES" || {
+              echo "::error::Built zedcore.aar has no native library for $abi"
+              exit 1
+            }
+          done
+
+          AAR_SHA="$(sha256sum app/libs/zedcore.aar | awk '{print $1}')"
+          {
+            echo "commit=$CORE_COMMIT"
+            echo "ref=$CORE_REF"
+            echo "aar_sha256=$AAR_SHA"
+            echo "go_version=$(go version)"
+            echo "ndk_version=28.2.13676358"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ZedSecure-Cores ref: $CORE_REF"
+            echo "ZedSecure-Cores commit: $CORE_COMMIT"
+            echo "Go: $(go version)"
+            echo "Android NDK: 28.2.13676358"
+            echo "Source-built zedcore.aar SHA-256: $AAR_SHA"
+            echo
+            echo "Pinned source dependencies (pins.txt):"
+            cat "$CORE_DIR/pins.txt"
+          } > zedcore-build-provenance.txt
+          echo ">>> Source-built zedcore.aar installed: $AAR_SHA"
+          {
+            echo "## zedcore source build"
+            echo "- Ref: \`$CORE_REF\`"
+            echo "- Commit: \`$CORE_COMMIT\`"
+            echo "- Go: \`$(go version)\`"
+            echo "- NDK: \`28.2.13676358\`"
+            echo "- AAR SHA-256: \`$AAR_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate native engine inputs
         shell: bash
@@ -338,6 +489,7 @@ jobs:
             fi
           done
 
+          cp zedcore-build-provenance.txt dist/BUILD-INFO-zedcore.txt
           ( cd dist && sha256sum ZedSecure-* > SHA256SUMS-android.txt )
           echo "AAB native libraries:"
           grep -E '^base/lib/(arm64-v8a|armeabi-v7a|x86_64)/.*\.so$' <<< "$AAB_ENTRIES" | sort
@@ -384,6 +536,7 @@ jobs:
             dist/ZedSecure-${{ steps.version.outputs.name }}-armeabi-v7a.apk
             dist/ZedSecure-${{ steps.version.outputs.name }}-x86_64.apk
             dist/SHA256SUMS-android.txt
+            dist/BUILD-INFO-zedcore.txt
           if-no-files-found: error
           retention-days: 30
 
