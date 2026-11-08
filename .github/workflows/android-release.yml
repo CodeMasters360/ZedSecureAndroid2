@@ -1,30 +1,31 @@
-
 name: android-release
 
 on:
   workflow_dispatch:
     inputs:
       signing_key:
-        description: "play = the key Google Play already knows; upload = the CA upload key"
+        description: "play = Google Play key; upload = CA upload key"
         type: choice
         default: play
         options: [play, upload]
+
       core_ref:
-        description: "ZedSecure-Cores tag/ref to build (default: zedcore-r6)"
+        description: "ZedSecure-Cores source tag or commit"
         type: string
         default: zedcore-r6
+
   workflow_call:
     inputs:
       signing_key:
-        description: "play or upload"
         type: string
         required: false
         default: play
+
       core_ref:
-        description: "ZedSecure-Cores tag/ref; use a tag or commit SHA"
         type: string
         required: false
         default: zedcore-r6
+
     secrets:
       KEYSTORE_BASE64:
         required: false
@@ -50,333 +51,914 @@ concurrency:
   group: android-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  TOR_VERSION: "0.4.9.13"
+  OPENSSL_VERSION: "3.6.5"
+  LIBEVENT_VERSION: "2.1.12-stable"
+
+  SNOWFLAKE_VERSION: "v2.14.1"
+  CONJURE_VERSION: "v0.0.0-20260113185639-0090962226b8"
+  LYREBIRD_VERSION: "v0.0.0-20260115133752-0b10edbb61e0"
+
+  SNISPOOF_VERSION: "v0.7.2"
+  HEV_VERSION: "2.18.0"
+  ZEPTUN_VERSION: "v1.1.3"
+  ZIG_VERSION: "0.16.0"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-      - name: Check out source
+
+      # --------------------------------------------------
+      # 1. Checkout Android application
+      # --------------------------------------------------
+
+      - name: Checkout ZedSecure
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Set up Java
+      # --------------------------------------------------
+      # 2. Java and Gradle
+      # --------------------------------------------------
+
+      - name: Setup Java
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
 
-      # Use preinstalled Android SDK and NDK.
-      # No sdkmanager and no repeated SDK/NDK downloads.
-      - name: Use preinstalled Android SDK and NDK
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      # --------------------------------------------------
+      # 3. USE PREINSTALLED ANDROID SDK / NDK
+      #
+      # No setup-android action.
+      # No sdkmanager.
+      # No SDK or NDK installation.
+      # --------------------------------------------------
+
+      - name: Validate preinstalled Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          NDK_VERSION="29.0.14206865"
-          NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
 
-          [[ -d "$SDK_ROOT/platforms/android-37.0" ]] || {
-            echo "::error::Android API 37 is not present on this runner image: $SDK_ROOT/platforms/android-37.0"
-            exit 1
-          }
-          [[ -x "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]] || {
-            echo "::error::Preinstalled NDK $NDK_VERSION is missing. No SDK/NDK download will be attempted."
-            exit 1
-          }
-          [[ -x "$SDK_ROOT/platform-tools/adb" ]] || {
-            echo "::error::Android platform-tools are missing from the runner image"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          [[ -d "$SDK" ]] || {
+            echo "::error::Android SDK not found: $SDK"
             exit 1
           }
 
-          BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
-          [[ -n "$BUILD_TOOLS" && -x "$BUILD_TOOLS/aapt2" && -x "$BUILD_TOOLS/apksigner" && -x "$BUILD_TOOLS/zipalign" ]] || {
-            echo "::error::Preinstalled Android build-tools are incomplete"
+          API_DIR="$(find "$SDK/platforms" \
+            -mindepth 1 -maxdepth 1 \
+            -type d -name 'android-37*' | head -n1)"
+
+          [[ -n "$API_DIR" ]] || {
+            echo "::error::Android API 37 is not installed"
+            exit 1
+          }
+
+          [[ -f "$API_DIR/android.jar" ]] || {
+            echo "::error::android.jar is missing"
+            exit 1
+          }
+
+          NDK="$(find "$SDK/ndk" \
+            -mindepth 1 -maxdepth 1 \
+            -type d | sort -V | tail -n1)"
+
+          [[ -n "$NDK" ]] || {
+            echo "::error::No preinstalled Android NDK found"
+            exit 1
+          }
+
+          NDK_VERSION="$(basename "$NDK")"
+          NDK_MAJOR="${NDK_VERSION%%.*}"
+
+          [[ "$NDK_MAJOR" =~ ^[0-9]+$ ]] &&
+          (( NDK_MAJOR >= 28 )) || {
+            echo "::error::NDK 28 or newer is required. Found: $NDK_VERSION"
+            exit 1
+          }
+
+          [[ -x "$NDK/ndk-build" ]] || {
+            echo "::error::ndk-build is missing"
+            exit 1
+          }
+
+          BUILD_TOOLS="$(find "$SDK/build-tools" \
+            -mindepth 1 -maxdepth 1 \
+            -type d | sort -V | tail -n1)"
+
+          [[ -x "$BUILD_TOOLS/apksigner" ]] || {
+            echo "::error::apksigner missing"
+            exit 1
+          }
+
+          [[ -x "$BUILD_TOOLS/zipalign" ]] || {
+            echo "::error::zipalign missing"
+            exit 1
+          }
+
+          [[ -x "$BUILD_TOOLS/aapt2" ]] || {
+            echo "::error::aapt2 missing"
             exit 1
           }
 
           {
-            echo "ANDROID_HOME=$SDK_ROOT"
-            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
-            echo "ANDROID_NDK_HOME=$NDK_ROOT"
-            echo "ANDROID_NDK_ROOT=$NDK_ROOT"
-            echo "ZED_ANDROID_NDK_VERSION=$NDK_VERSION"
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
+            echo "ANDROID_BUILD_TOOLS=$BUILD_TOOLS"
+            echo "ANDROID_NDK_VERSION=$NDK_VERSION"
           } >> "$GITHUB_ENV"
 
-          echo "Using preinstalled Android SDK: $SDK_ROOT"
-          echo "Using Android API: 37.0"
-          echo "Using preinstalled build-tools: $(basename "$BUILD_TOOLS")"
-          echo "Using preinstalled NDK: $NDK_VERSION"
+          echo "SDK: $SDK"
+          echo "Android API: 37"
+          echo "NDK: $NDK_VERSION"
+          echo "Build Tools: $(basename "$BUILD_TOOLS")"
 
-      - name: Set up Go for zedcore
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.27.3"
-          cache: false
+      # --------------------------------------------------
+      # 4. Read project version
+      # --------------------------------------------------
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v5
-
-      - name: Read and validate version
+      - name: Read application version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          VERSION_NAME="$(sed -n 's/^zedsecure.versionName=//p' gradle.properties | head -n1)"
-          VERSION_CODE="$(sed -n 's/^zedsecure.versionCode=//p' gradle.properties | head -n1)"
-          [[ -n "$VERSION_NAME" ]] || { echo "::error::zedsecure.versionName is missing"; exit 1; }
-          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "::error::zedsecure.versionCode must be numeric"; exit 1; }
+
+          VERSION_NAME="$(sed -n \
+            's/^zedsecure.versionName=//p' \
+            gradle.properties | head -n1)"
+
+          VERSION_CODE="$(sed -n \
+            's/^zedsecure.versionCode=//p' \
+            gradle.properties | head -n1)"
+
+          [[ -n "$VERSION_NAME" ]] || {
+            echo "::error::Version name is missing"
+            exit 1
+          }
+
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || {
+            echo "::error::Invalid version code"
+            exit 1
+          }
+
           {
             echo "name=$VERSION_NAME"
             echo "code=$VERSION_CODE"
           } >> "$GITHUB_OUTPUT"
-          echo "Building ZedSecure $VERSION_NAME (versionCode $VERSION_CODE)"
 
-      # Fetch pinned engines but skip the prebuilt zedcore.aar.
-      - name: Fetch pinned Android native engines (without prebuilt zedcore)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
+      # --------------------------------------------------
+      # 5. Get Core SOURCE CODE
+      #
+      # This is NOT a binary download.
+      # Only the source repository is cloned.
+      # --------------------------------------------------
 
-          source = Path("tools/get-cores.sh").read_text(encoding="utf-8")
-          needle = '    cp "$(fetch zedcore zedcore.aar)" "$ROOT/app/libs/zedcore.aar"\n'
-          if source.count(needle) != 1:
-              raise SystemExit("get-cores.sh changed; refusing to guess how to skip its prebuilt zedcore.aar download")
-
-          target = Path("tools/.get-cores-native-only.sh")
-          target.write_text(
-              source.replace(
-                  needle,
-                  "    # zedcore.aar is built from source in the next workflow step.\n"
-              ),
-              encoding="utf-8",
-          )
-          target.chmod(0o755)
-          PY
-          trap 'rm -f tools/.get-cores-native-only.sh' EXIT
-          ./tools/.get-cores-native-only.sh android
-
-      # Compile zedcore.aar from source.
-      # The official Core build script applies the Psiphon TLS patch.
-      - name: Build zedcore.aar from source
-        id: core
+      - name: Checkout ZedSecure-Cores source
+        id: cores
         shell: bash
         env:
-          CORES_REF: ${{ inputs.core_ref }}
-          GOTOOLCHAIN: go1.27.3
+          CORE_REF: ${{ inputs.core_ref }}
         run: |
           set -euo pipefail
-          CORE_REF="${CORES_REF:-zedcore-r6}"
+
+          CORE_REF="${CORE_REF:-zedcore-r6}"
           CORE_DIR="$RUNNER_TEMP/ZedSecure-Cores"
+
           rm -rf "$CORE_DIR"
 
           git init "$CORE_DIR"
-          git -C "$CORE_DIR" remote add origin https://github.com/CluvexStudio/ZedSecure-Cores.git
-          git -C "$CORE_DIR" fetch --no-tags --depth=1 origin "$CORE_REF"
+
+          git -C "$CORE_DIR" remote add origin \
+            https://github.com/CluvexStudio/ZedSecure-Cores.git
+
+          git -C "$CORE_DIR" fetch \
+            --depth 1 origin "$CORE_REF"
+
           git -C "$CORE_DIR" checkout --detach FETCH_HEAD
+
           CORE_COMMIT="$(git -C "$CORE_DIR" rev-parse HEAD)"
 
-          echo "ZedSecure-Cores ref: $CORE_REF"
-          echo "ZedSecure-Cores commit: $CORE_COMMIT"
+          {
+            echo "CORES_DIR=$CORE_DIR"
+            echo "CORES_REF=$CORE_REF"
+            echo "CORES_COMMIT=$CORE_COMMIT"
+          } >> "$GITHUB_ENV"
 
-          test -s "$CORE_DIR/scripts/fetch.sh"
-          test -s "$CORE_DIR/scripts/build-zedcore.sh"
-          test -s "$CORE_DIR/patches/psiphon-tls-go1.27.patch"
+          {
+            echo "ref=$CORE_REF"
+            echo "commit=$CORE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
 
-          echo ">>> Fetching exact dependency commits from pins.txt"
-          (cd "$CORE_DIR" && ./scripts/fetch.sh)
+          echo "Core source: $CORE_REF"
+          echo "Commit: $CORE_COMMIT"
 
-          echo ">>> Installing gomobile with Go 1.27.3"
-          export PATH="$HOME/go/bin:$PATH"
+      # --------------------------------------------------
+      # 6. Build zedcore.aar from source
+      # --------------------------------------------------
+
+      - name: Setup Go for ZedCore
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - name: Build zedcore.aar from source
+        id: zedcore
+        shell: bash
+        env:
+          GOTOOLCHAIN: go1.27.3
+        run: |
+          set -euo pipefail
+
+          cd "$CORES_DIR"
+
+          echo ">>> Fetching pinned source dependencies"
+
+          ./scripts/fetch.sh
+
+          echo ">>> Installing gomobile"
+
           go version
+
           go install golang.org/x/mobile/cmd/gomobile@latest
-          command -v gomobile
+
+          export PATH="$HOME/go/bin:$PATH"
+
           gomobile init
 
-          # Remove any pre-existing AAR to ensure source compilation.
-          rm -f app/libs/zedcore.aar
+          mkdir -p "$GITHUB_WORKSPACE/app/libs"
 
-          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:?ANDROID_NDK_HOME was not set by the runner check}"
-          export JAVA_HOME="$JAVA_HOME"
+          rm -f "$GITHUB_WORKSPACE/app/libs/zedcore.aar"
+
+          echo ">>> Building ZedCore for Android"
+
+          export ANDROID_HOME
+          export ANDROID_NDK_HOME
           export TARGETS="android/arm64,android/arm,android/amd64"
-          export PATH="$HOME/go/bin:$JAVA_HOME/bin:$PATH"
 
-          (cd "$CORE_DIR" && ./scripts/build-zedcore.sh)
+          ./scripts/build-zedcore.sh
 
-          BUILT_AAR="$CORE_DIR/out/zedcore.aar"
-          [[ -s "$BUILT_AAR" ]] || {
+          AAR="$CORES_DIR/out/zedcore.aar"
+
+          [[ -s "$AAR" ]] || {
             echo "::error::Source build did not produce zedcore.aar"
             exit 1
           }
 
-          mkdir -p app/libs
-          install -m 0644 "$BUILT_AAR" app/libs/zedcore.aar
-          unzip -tq app/libs/zedcore.aar
+          install -m 0644 "$AAR" \
+            "$GITHUB_WORKSPACE/app/libs/zedcore.aar"
 
-          AAR_ENTRIES="$(unzip -Z1 app/libs/zedcore.aar)"
-          grep -Fxq 'classes.jar' <<< "$AAR_ENTRIES" || {
-            echo "::error::Built AAR has no classes.jar"
-            exit 1
-          }
+          unzip -tq "$GITHUB_WORKSPACE/app/libs/zedcore.aar"
 
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            grep -Eq "^jni/$abi/[^/]+\.so$" <<< "$AAR_ENTRIES" || {
-              echo "::error::Built zedcore.aar has no native library for $abi"
-              exit 1
-            }
-          done
+          AAR_SHA="$(sha256sum \
+            "$GITHUB_WORKSPACE/app/libs/zedcore.aar" |
+            awk '{print $1}')"
 
-          AAR_SHA="$(sha256sum app/libs/zedcore.aar | awk '{print $1}')"
+          echo "AAR_SHA=$AAR_SHA" >> "$GITHUB_ENV"
 
-          {
-            echo "commit=$CORE_COMMIT"
-            echo "ref=$CORE_REF"
-            echo "aar_sha256=$AAR_SHA"
-            echo "go_version=$(go version)"
-            echo "ndk_version=${ZED_ANDROID_NDK_VERSION}"
-          } >> "$GITHUB_OUTPUT"
+          echo "ZedCore SHA256: $AAR_SHA"
 
-          {
-            echo "ZedSecure-Cores ref: $CORE_REF"
-            echo "ZedSecure-Cores commit: $CORE_COMMIT"
-            echo "Go: $(go version)"
-            echo "Android NDK: ${ZED_ANDROID_NDK_VERSION}"
-            echo "Source-built zedcore.aar SHA-256: $AAR_SHA"
-            echo
-            echo "Pinned source dependencies (pins.txt):"
-            cat "$CORE_DIR/pins.txt"
-          } > zedcore-build-provenance.txt
+      # --------------------------------------------------
+      # 7. Remove stale copies of the native engines
+      #
+      # Prevent old binaries from accidentally entering
+      # the new APK.
+      # --------------------------------------------------
 
-          echo ">>> Source-built zedcore.aar installed: $AAR_SHA"
-
-          {
-            echo "## zedcore source build"
-            echo "- Ref: \`$CORE_REF\`"
-            echo "- Commit: \`$CORE_COMMIT\`"
-            echo "- Go: \`$(go version)\`"
-            echo "- NDK: \`${ZED_ANDROID_NDK_VERSION}\`"
-            echo "- AAR SHA-256: \`$AAR_SHA\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Validate native engine inputs
+      - name: Prepare native library directories
         shell: bash
         run: |
           set -euo pipefail
-          test -s app/libs/zedcore.aar || {
-            echo "::error::app/libs/zedcore.aar is missing"
-            exit 1
-          }
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          mkdir -p "$JNI"
 
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            abi_dir="app/src/main/jniLibs/$abi"
-            mkdir -p "$abi_dir"
+            mkdir -p "$JNI/$abi"
 
-            for lib in libtor libobfs4proxy libsnowflake libconjure libsnispoof libhev-socks5-tunnel libopenconnect libzeptun-jni; do
-              if [[ ! -f "$abi_dir/$lib.so" ]]; then
-                echo "::warning::$abi/$lib.so is missing; that optional engine may not be available for this ABI"
-              fi
-            done
+            for lib in \
+              libtor.so \
+              libobfs4proxy.so \
+              libconjure.so \
+              libsnowflake.so \
+              libsnispoof.so \
+              libhev-socks5-tunnel.so \
+              libzeptun.so \
+              libzeptun-jni.so; do
 
-            for lib in libhev-socks5-tunnel libopenconnect libzeptun-jni; do
-              so="$abi_dir/$lib.so"
-              [[ -f "$so" ]] || continue
-
-              if ! readelf --dyn-syms -W "$so" | grep -qE ' (JNI_OnLoad|Java_)'; then
-                echo "::error::$so has no JNI entry points"
-                exit 1
-              fi
-            done
-
-            for so in "$abi_dir"/*.so; do
-              [[ -f "$so" ]] || continue
-              case "$so" in
-                */libzeptun*) continue ;;
-              esac
-
-              if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then
-                echo "::error::$so uses RELR relocations, which are incompatible with Android 7/8"
-                exit 1
-              fi
+              rm -f "$JNI/$abi/$lib"
             done
           done
 
-          echo "Native libraries found:"
-          find app/src/main/jniLibs -type f -name '*.so' -print | sort
+      # --------------------------------------------------
+      # 8. TOR + OPENSSL + LIBEVENT FROM SOURCE
+      #
+      # Official ZedSecure-Cores build script:
+      # scripts/build-tor-android.sh
+      #
+      # Includes the official fake-SNI patch.
+      # --------------------------------------------------
 
-      - name: Configure release signing
+      - name: Setup Go for Tor transports
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build Tor from source for all ABIs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$CORES_DIR"
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          echo ">>> Building Tor, OpenSSL and Libevent"
+
+          NDK="$ANDROID_NDK_HOME" \
+          OUT="$JNI" \
+          WORK="$RUNNER_TEMP/tor-build" \
+          TOR_VERSION="$TOR_VERSION" \
+          OPENSSL_VERSION="$OPENSSL_VERSION" \
+          LIBEVENT_VERSION="$LIBEVENT_VERSION" \
+          ./scripts/build-tor-android.sh
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            so="$JNI/$abi/libtor.so"
+
+            [[ -s "$so" ]] || {
+              echo "::error::Tor source build failed for $abi"
+              exit 1
+            }
+
+            grep -aq -- '--fake-hosts' "$so" || {
+              echo "::error::Tor fake-SNI patch is missing for $abi"
+              exit 1
+            }
+
+            chmod 755 "$so"
+
+            echo "Tor built: $abi"
+          done
+
+      # --------------------------------------------------
+      # 9. OBFS4 / CONJURE / SNOWFLAKE FROM SOURCE
+      #
+      # These are Go source modules.
+      # No Android Release binaries are used.
+      # --------------------------------------------------
+
+      - name: Build Tor transports from source
+        shell: bash
+        env:
+          LYREBIRD: ${{ env.LYREBIRD_VERSION }}
+          CONJURE: ${{ env.CONJURE_VERSION }}
+          SNOWFLAKE: ${{ env.SNOWFLAKE_VERSION }}
+        run: |
+          set -euo pipefail
+
+          NDK="$ANDROID_NDK_HOME"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          mkdir -p "$RUNNER_TEMP/tor-transports"
+
+          source_dir() {
+            go mod download -json "$1@$2" |
+              python3 -c \
+                'import sys,json; print(json.load(sys.stdin)["Dir"])'
+          }
+
+          echo ">>> Fetching source modules"
+
+          LYREBIRD_DIR="$(source_dir \
+            gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird \
+            "$LYREBIRD")"
+
+          CONJURE_DIR="$(source_dir \
+            gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/conjure \
+            "$CONJURE")"
+
+          SNOWFLAKE_DIR="$(source_dir \
+            gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2 \
+            "$SNOWFLAKE")"
+
+          [[ -d "$LYREBIRD_DIR/cmd/lyrebird" ]] || {
+            echo "::error::Lyrebird source is missing"
+            exit 1
+          }
+
+          [[ -d "$CONJURE_DIR/client" ]] || {
+            echo "::error::Conjure source is missing"
+            exit 1
+          }
+
+          [[ -d "$SNOWFLAKE_DIR/client" ]] || {
+            echo "::error::Snowflake source is missing"
+            exit 1
+          }
+
+          for spec in \
+            "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+            "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+            "amd64:x86_64:x86_64-linux-android24-clang"; do
+
+            IFS=: read -r arch abi cc <<< "$spec"
+
+            echo ">>> Building Tor transports for $abi"
+
+            mkdir -p "$JNI/$abi"
+
+            export CGO_ENABLED=1
+            export GOOS=android
+            export GOARCH="$arch"
+            export GOARM=7
+            export CC="$BIN/$cc"
+
+            (
+              cd "$LYREBIRD_DIR"
+
+              go build \
+                -trimpath \
+                -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+                -o "$JNI/$abi/libobfs4proxy.so" \
+                ./cmd/lyrebird
+            )
+
+            (
+              cd "$CONJURE_DIR"
+
+              go build \
+                -trimpath \
+                -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+                -o "$JNI/$abi/libconjure.so" \
+                ./client
+            )
+
+            (
+              cd "$SNOWFLAKE_DIR"
+
+              go build \
+                -trimpath \
+                -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+                -o "$JNI/$abi/libsnowflake.so" \
+                ./client
+            )
+
+            chmod 755 "$JNI/$abi/"*.so
+          done
+
+      # --------------------------------------------------
+      # 10. SNI SPOOF FROM SOURCE
+      #
+      # Source: aleskxyz/SNI-Spoofing-Go
+      # Tag: v0.7.2
+      # --------------------------------------------------
+
+      - name: Setup Go for SNI Spoof
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.3"
+          cache: false
+
+      - name: Build SNI Spoof from source
+        id: snispoof
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="$RUNNER_TEMP/SNI-Spoofing-Go"
+
+          git clone \
+            --depth 1 \
+            --branch "$SNISPOOF_VERSION" \
+            https://github.com/aleskxyz/SNI-Spoofing-Go.git \
+            "$SRC"
+
+          COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+
+          echo "SNISPOOF_COMMIT=$COMMIT" >> "$GITHUB_ENV"
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          for spec in \
+            "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+            "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+            "amd64:x86_64:x86_64-linux-android24-clang"; do
+
+            IFS=: read -r arch abi cc <<< "$spec"
+
+            echo ">>> Building SNI Spoof for $abi"
+
+            mkdir -p "$JNI/$abi"
+
+            (
+              cd "$SRC"
+
+              CGO_ENABLED=1 \
+              CC="$BIN/$cc" \
+              GOOS=android \
+              GOARCH="$arch" \
+              GOARM=7 \
+              go build \
+                -trimpath \
+                -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" \
+                -o "$JNI/$abi/libsnispoof.so" \
+                .
+            )
+
+            chmod 755 "$JNI/$abi/libsnispoof.so"
+
+          done
+
+      # --------------------------------------------------
+      # 11. HEV SOCKS5 TUNNEL FROM SOURCE
+      #
+      # Source: heiher/hev-socks5-tunnel
+      # Tag: 2.18.0
+      # Built with NDK.
+      # --------------------------------------------------
+
+      - name: Build HEV from source
+        id: hev
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HEV_DIR="$RUNNER_TEMP/hev"
+
+          mkdir -p "$HEV_DIR"
+
+          git clone \
+            --depth 1 \
+            --branch "$HEV_VERSION" \
+            --recursive \
+            https://github.com/heiher/hev-socks5-tunnel \
+            "$HEV_DIR/jni"
+
+          COMMIT="$(git -C "$HEV_DIR/jni" rev-parse HEAD)"
+
+          echo "HEV_COMMIT=$COMMIT" >> "$GITHUB_ENV"
+
+          echo ">>> Building HEV with Android NDK"
+
+          "$ANDROID_NDK_HOME/ndk-build" \
+            -C "$HEV_DIR" \
+            -j"$(nproc)" \
+            APP_ABI="arm64-v8a armeabi-v7a x86_64" \
+            APP_MODULES=hev-socks5-tunnel \
+            APP_PLATFORM=android-24
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+
+            SRC="$HEV_DIR/libs/$abi/libhev-socks5-tunnel.so"
+            DST="$JNI/$abi/libhev-socks5-tunnel.so"
+
+            [[ -s "$SRC" ]] || {
+              echo "::error::HEV library missing for $abi"
+              exit 1
+            }
+
+            mkdir -p "$JNI/$abi"
+            install -m 0755 "$SRC" "$DST"
+
+            readelf --dyn-syms -W "$DST" |
+              grep -qw JNI_OnLoad || {
+                echo "::error::HEV JNI_OnLoad is missing for $abi"
+                exit 1
+              }
+
+            grep -aq 'hev/htproxy/TProxyService' "$DST" || {
+              echo "::error::HEV JNI class binding is missing for $abi"
+              exit 1
+            }
+
+          done
+
+      # --------------------------------------------------
+      # 12. ZEPTUN FROM SOURCE
+      #
+      # Source: Noisemux/zeptun
+      # Version: v1.1.3
+      # Zig: 0.16.0
+      # JNI: built using Android NDK.
+      # --------------------------------------------------
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build Zeptun from source
+        id: zeptun
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZEP_DIR="$RUNNER_TEMP/zeptun"
+
+          git clone \
+            --depth 1 \
+            --branch "$ZEPTUN_VERSION" \
+            https://github.com/Noisemux/zeptun.git \
+            "$ZEP_DIR"
+
+          COMMIT="$(git -C "$ZEP_DIR" rev-parse HEAD)"
+
+          echo "ZEPTUN_COMMIT=$COMMIT" >> "$GITHUB_ENV"
+
+          echo "Zig version:"
+          zig version
+
+          [[ "$(zig version)" == "$ZIG_VERSION" ]] || {
+            echo "::error::Unexpected Zig version"
+            exit 1
+          }
+
+          echo ">>> Compiling Zeptun for Android"
+
+          cd "$ZEP_DIR"
+
+          ABIS="armeabi-v7a arm64-v8a x86_64" \
+          ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+          sh scripts/build_android.sh
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+
+            SRC="$ZEP_DIR/zig-out/android/jniLibs/$abi"
+            DST="$JNI/$abi"
+
+            [[ -s "$SRC/libzeptun.so" ]] || {
+              echo "::error::Zeptun engine missing for $abi"
+              exit 1
+            }
+
+            [[ -s "$SRC/libzeptun-jni.so" ]] || {
+              echo "::error::Zeptun JNI missing for $abi"
+              exit 1
+            }
+
+            mkdir -p "$DST"
+
+            install -m 0755 "$SRC/libzeptun.so" "$DST/"
+            install -m 0755 "$SRC/libzeptun-jni.so" "$DST/"
+
+          done
+
+          echo "Zeptun source build completed."
+
+      # --------------------------------------------------
+      # 13. VALIDATE EVERY NATIVE ENGINE
+      #
+      # The build must fail if any required engine
+      # or ABI is missing.
+      # --------------------------------------------------
+
+      - name: Validate all source-built native engines
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          JNI="$GITHUB_WORKSPACE/app/src/main/jniLibs"
+
+          check_16k() {
+            local so="$1"
+            local align
+            local value
+            local found=0
+
+            while read -r align; do
+              [[ -n "$align" ]] || continue
+
+              found=1
+              value=$((align))
+
+              if (( value < 16384 )); then
+                echo "::error::$so contains a LOAD segment below 16 KB alignment: $align"
+                return 1
+              fi
+
+            done < <(
+              readelf -lW "$so" |
+                awk '$1 == "LOAD" { print $NF }'
+            )
+
+            (( found == 1 )) || {
+              echo "::error::No LOAD segments found: $so"
+              return 1
+            }
+          }
+
+          check_machine() {
+            local so="$1"
+            local abi="$2"
+            local machine
+
+            machine="$(readelf -h "$so" |
+              sed -n 's/.*Machine:[[:space:]]*//p' | head -n1)"
+
+            case "$abi" in
+              arm64-v8a)
+                [[ "$machine" == "AArch64" ]]
+                ;;
+              armeabi-v7a)
+                [[ "$machine" == "ARM" ]]
+                ;;
+              x86_64)
+                [[ "$machine" == "Advanced Micro Devices X86-64" ]]
+                ;;
+              *)
+                return 1
+                ;;
+            esac || {
+              echo "::error::Wrong architecture: $so ($machine)"
+              return 1
+            }
+          }
+
+          LIBRARIES="
+          libtor.so
+          libobfs4proxy.so
+          libconjure.so
+          libsnowflake.so
+          libsnispoof.so
+          libhev-socks5-tunnel.so
+          libzeptun.so
+          libzeptun-jni.so
+          "
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+
+            echo "======================================"
+            echo "Validating $abi"
+            echo "======================================"
+
+            ABI_DIR="$JNI/$abi"
+
+            for lib in $LIBRARIES; do
+
+              so="$ABI_DIR/$lib"
+
+              [[ -s "$so" ]] || {
+                echo "::error::Missing $abi/$lib"
+                exit 1
+              }
+
+              check_machine "$so" "$abi"
+              check_16k "$so"
+
+              if readelf -d "$so" |
+                grep -qE '\(RELR\)|0x0*6fffe000 '; then
+
+                echo "::error::$so uses RELR relocations"
+                exit 1
+              fi
+
+              echo "OK: $abi/$lib"
+
+            done
+
+            # JNI checks
+            for lib in \
+              libhev-socks5-tunnel.so \
+              libzeptun-jni.so; do
+
+              so="$ABI_DIR/$lib"
+
+              readelf --dyn-syms -W "$so" |
+                grep -qw JNI_OnLoad || {
+                  echo "::error::$so has no JNI_OnLoad"
+                  exit 1
+                }
+            done
+
+          done
+
+          # Verify source-built ZedCore AAR
+          test -s app/libs/zedcore.aar
+
+          AAR_CONTENT="$(unzip -Z1 app/libs/zedcore.aar)"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+
+            grep -Eq "^jni/$abi/.*\.so$" <<< "$AAR_CONTENT" || {
+              echo "::error::ZedCore AAR has no native library for $abi"
+              exit 1
+            }
+
+          done
+
+          echo "All required Native engines passed validation."
+
+      # --------------------------------------------------
+      # 14. SIGNING
+      # --------------------------------------------------
+
+      - name: Unlock signing key
         shell: bash
         env:
           SIGNING_KEY: ${{ inputs.signing_key }}
+
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
           PLAY_KEYSTORE_BASE64: ${{ secrets.PLAY_KEYSTORE_BASE64 }}
           PLAY_KEYSTORE_PASSWORD: ${{ secrets.PLAY_KEYSTORE_PASSWORD }}
           PLAY_KEY_ALIAS: ${{ secrets.PLAY_KEY_ALIAS }}
           PLAY_KEY_PASSWORD: ${{ secrets.PLAY_KEY_PASSWORD }}
+
         run: |
           set -euo pipefail
           umask 077
 
           case "$SIGNING_KEY" in
+
             play)
-              ENCODED_KEYSTORE="${PLAY_KEYSTORE_BASE64:?Missing PLAY_KEYSTORE_BASE64}"
-              STORE_PASSWORD="${PLAY_KEYSTORE_PASSWORD:?Missing PLAY_KEYSTORE_PASSWORD}"
-              ALIAS="${PLAY_KEY_ALIAS:?Missing PLAY_KEY_ALIAS}"
-              KEY_PASSWORD_VALUE="${PLAY_KEY_PASSWORD:?Missing PLAY_KEY_PASSWORD}"
+              ENCODED="$PLAY_KEYSTORE_BASE64"
+              STORE_PW="$PLAY_KEYSTORE_PASSWORD"
+              ALIAS="$PLAY_KEY_ALIAS"
+              KEY_PW="$PLAY_KEY_PASSWORD"
               ;;
+
             upload)
-              ENCODED_KEYSTORE="${KEYSTORE_BASE64:?Missing KEYSTORE_BASE64}"
-              STORE_PASSWORD="${KEYSTORE_PASSWORD:?Missing KEYSTORE_PASSWORD}"
-              ALIAS="${KEY_ALIAS:?Missing KEY_ALIAS}"
-              KEY_PASSWORD_VALUE="${KEY_PASSWORD:?Missing KEY_PASSWORD}"
+              ENCODED="$KEYSTORE_BASE64"
+              STORE_PW="$KEYSTORE_PASSWORD"
+              ALIAS="$KEY_ALIAS"
+              KEY_PW="$KEY_PASSWORD"
               ;;
+
             *)
-              echo "::error::signing_key must be 'play' or 'upload'"
+              echo "::error::Invalid signing key"
               exit 1
               ;;
           esac
 
-          printf '%s' "$ENCODED_KEYSTORE" | tr -d '[:space:]' | base64 --decode > release.keystore
-          test -s release.keystore || {
-            echo "::error::Decoded keystore is empty"
+          [[ -n "$ENCODED" ]] || {
+            echo "::error::Keystore secret is missing"
             exit 1
           }
 
-          export ZED_STORE_PASSWORD="$STORE_PASSWORD"
-          export ZED_KEY_PASSWORD="$KEY_PASSWORD_VALUE"
+          [[ -n "$STORE_PW" && -n "$ALIAS" && -n "$KEY_PW" ]] || {
+            echo "::error::Signing credentials are incomplete"
+            exit 1
+          }
+
+          printf '%s' "$ENCODED" |
+            tr -d '[:space:]' |
+            base64 --decode > release.keystore
+
+          test -s release.keystore
+
+          export ZED_STORE_PASSWORD="$STORE_PW"
+          export ZED_KEY_PASSWORD="$KEY_PW"
           export ZED_KEY_ALIAS="$ALIAS"
 
           python3 - <<'PY'
           import os
           from pathlib import Path
 
-          def escape_property(value: str) -> str:
-              replacements = {
-                  "\\": "\\\\",
-                  "\t": "\\t",
-                  "\n": "\\n",
-                  "\r": "\\r",
-                  "\f": "\\f",
-              }
+          def escape_property(value):
               result = []
+
               for index, char in enumerate(value):
-                  if char in replacements:
-                      result.append(replacements[char])
-                  elif char in " =:#!" and (index == 0 or char != " "):
+                  if char == "\\":
+                      result.append("\\\\")
+                  elif char in "\t\n\r\f":
+                      result.append({
+                          "\t": "\\t",
+                          "\n": "\\n",
+                          "\r": "\\r",
+                          "\f": "\\f",
+                      }[char])
+                  elif char in "=:#!" or (char == " " and index == 0):
                       result.append("\\" + char)
-                  elif char == " " and index == 0:
-                      result.append("\\ ")
                   else:
                       result.append(char)
+
               return "".join(result)
 
-          properties = {
+          values = {
               "storeFile": "release.keystore",
               "storePassword": os.environ["ZED_STORE_PASSWORD"],
               "keyPassword": os.environ["ZED_KEY_PASSWORD"],
@@ -386,81 +968,95 @@ jobs:
           Path("keystore.properties").write_text(
               "".join(
                   f"{key}={escape_property(value)}\n"
-                  for key, value in properties.items()
+                  for key, value in values.items()
               ),
               encoding="utf-8",
           )
+
           Path("keystore.properties").chmod(0o600)
           PY
 
-      # Build APK splits in a separate Gradle invocation.
-      - name: Build split APKs
-        run: ./gradlew --no-daemon --warning-mode all :app:assembleRelease
+      # --------------------------------------------------
+      # 15. BUILD APK SPLITS
+      # --------------------------------------------------
+
+      - name: Build Android APK splits
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --warning-mode all \
+            :app:assembleRelease
+
+      # --------------------------------------------------
+      # 16. CREATE UNIVERSAL APK
+      # --------------------------------------------------
 
       - name: Package and verify APKs
-        id: apk
         shell: bash
         env:
           SIGNING_KEY: ${{ inputs.signing_key }}
+
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
           PLAY_KEYSTORE_PASSWORD: ${{ secrets.PLAY_KEYSTORE_PASSWORD }}
           PLAY_KEY_ALIAS: ${{ secrets.PLAY_KEY_ALIAS }}
           PLAY_KEY_PASSWORD: ${{ secrets.PLAY_KEY_PASSWORD }}
+
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.name }}'
+
+          VERSION="${{ steps.version.outputs.name }}"
           mkdir -p dist
 
+          BT="$ANDROID_BUILD_TOOLS"
+
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            src="app/build/outputs/apk/release/app-$abi-release.apk"
-            [[ -s "$src" ]] || {
-              echo "::error::Missing split APK: $src"
+
+            SRC="app/build/outputs/apk/release/app-$abi-release.apk"
+
+            [[ -s "$SRC" ]] || {
+              echo "::error::APK missing: $SRC"
               exit 1
             }
-            cp "$src" "dist/ZedSecure-$VERSION-$abi.apk"
+
+            cp "$SRC" "dist/ZedSecure-$VERSION-$abi.apk"
+
           done
 
-          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          # Create Universal APK from ARM splits.
 
-          [[ -x "$BT/apksigner" && -x "$BT/zipalign" && -x "$BT/aapt2" ]] || {
-            echo "::error::Android build-tools are incomplete: $BT"
-            exit 1
-          }
-
-          # Merge ARM APKs using the project's official helper.
           python3 tools/universal-apk.py \
             "dist/ZedSecure-$VERSION-arm64-v8a.apk" \
-            /tmp/zedsecure-universal.apk \
+            /tmp/universal.apk \
             "dist/ZedSecure-$VERSION-armeabi-v7a.apk"
 
           "$BT/zipalign" -f -P 16 4 \
-            /tmp/zedsecure-universal.apk \
-            /tmp/zedsecure-universal-aligned.apk
+            /tmp/universal.apk \
+            /tmp/universal-aligned.apk
 
           case "$SIGNING_KEY" in
+
             play)
-              STORE_PW="${PLAY_KEYSTORE_PASSWORD:?Missing PLAY_KEYSTORE_PASSWORD}"
-              KEY_PW="${PLAY_KEY_PASSWORD:?Missing PLAY_KEY_PASSWORD}"
-              KEY_ALIAS_VALUE="${PLAY_KEY_ALIAS:?Missing PLAY_KEY_ALIAS}"
+              STORE_PW="$PLAY_KEYSTORE_PASSWORD"
+              KEY_PW="$PLAY_KEY_PASSWORD"
+              ALIAS="$PLAY_KEY_ALIAS"
               ;;
+
             upload)
-              STORE_PW="${KEYSTORE_PASSWORD:?Missing KEYSTORE_PASSWORD}"
-              KEY_PW="${KEY_PASSWORD:?Missing KEY_PASSWORD}"
-              KEY_ALIAS_VALUE="${KEY_ALIAS:?Missing KEY_ALIAS}"
+              STORE_PW="$KEYSTORE_PASSWORD"
+              KEY_PW="$KEY_PASSWORD"
+              ALIAS="$KEY_ALIAS"
               ;;
-            *)
-              echo "::error::signing_key must be 'play' or 'upload'"
-              exit 1
-              ;;
+
           esac
 
           export STORE_PW KEY_PW
 
           "$BT/apksigner" sign \
             --ks release.keystore \
-            --ks-key-alias "$KEY_ALIAS_VALUE" \
+            --ks-key-alias "$ALIAS" \
             --ks-pass env:STORE_PW \
             --key-pass env:KEY_PW \
             --v1-signing-enabled false \
@@ -468,43 +1064,37 @@ jobs:
             --v3-signing-enabled false \
             --v4-signing-enabled false \
             --out "dist/ZedSecure-$VERSION-universal.apk" \
-            /tmp/zedsecure-universal-aligned.apk
+            /tmp/universal-aligned.apk
 
-          rm -f /tmp/zedsecure-universal.apk /tmp/zedsecure-universal-aligned.apk
+          rm -f /tmp/universal.apk /tmp/universal-aligned.apk
 
           REFERENCE_CERT=""
 
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            apk="dist/ZedSecure-$VERSION-$abi.apk"
 
-            "$BT/apksigner" verify "$apk"
-            "$BT/zipalign" -c -P 16 4 "$apk"
+            APK="dist/ZedSecure-$VERSION-$abi.apk"
 
-            BADGING="$("$BT/aapt2" dump badging "$apk")"
+            "$BT/apksigner" verify "$APK"
+            "$BT/zipalign" -c -P 16 4 "$APK"
 
-            grep -Fq "versionName='$VERSION'" <<< "$BADGING" || {
-              echo "::error::$apk has an unexpected versionName"
-              exit 1
-            }
-
-            grep -Fq "native-code: '$abi'" <<< "$BADGING" || {
-              echo "::error::$apk does not contain the expected ABI ($abi)"
-              exit 1
-            }
-
-            CERT="$("$BT/apksigner" verify --print-certs "$apk" | grep -m1 'SHA-256' | awk '{print $NF}')"
+            CERT="$(
+              "$BT/apksigner" verify --print-certs "$APK" |
+              grep -m1 'SHA-256' |
+              awk '{print $NF}'
+            )"
 
             [[ -n "$CERT" ]] || {
-              echo "::error::Could not read signer certificate for $apk"
+              echo "::error::Could not read APK certificate"
               exit 1
             }
 
             if [[ -z "$REFERENCE_CERT" ]]; then
               REFERENCE_CERT="$CERT"
             elif [[ "$CERT" != "$REFERENCE_CERT" ]]; then
-              echo "::error::$apk is signed with a different certificate"
+              echo "::error::APK signing certificates do not match"
               exit 1
             fi
+
           done
 
           UNIVERSAL="dist/ZedSecure-$VERSION-universal.apk"
@@ -512,71 +1102,129 @@ jobs:
           "$BT/apksigner" verify "$UNIVERSAL"
           "$BT/zipalign" -c -P 16 4 "$UNIVERSAL"
 
-          UNIVERSAL_BADGING="$("$BT/aapt2" dump badging "$UNIVERSAL")"
-
-          grep -Fq "native-code: 'arm64-v8a' 'armeabi-v7a'" <<< "$UNIVERSAL_BADGING" || {
-            echo "::error::Universal APK does not contain both ARM ABIs"
-            exit 1
-          }
-
-          UNIVERSAL_CERT="$("$BT/apksigner" verify --print-certs "$UNIVERSAL" | grep -m1 'SHA-256' | awk '{print $NF}')"
+          UNIVERSAL_CERT="$(
+            "$BT/apksigner" verify --print-certs "$UNIVERSAL" |
+            grep -m1 'SHA-256' |
+            awk '{print $NF}'
+          )"
 
           [[ "$UNIVERSAL_CERT" == "$REFERENCE_CERT" ]] || {
-            echo "::error::Universal APK signer does not match the split APKs"
+            echo "::error::Universal APK signer mismatch"
             exit 1
           }
 
-          echo "Verified APKs:"
+          "$BT/aapt2" dump badging "$UNIVERSAL" |
+            grep -Fq "native-code: 'arm64-v8a' 'armeabi-v7a'" || {
+              echo "::error::Universal APK is missing ARM ABIs"
+              exit 1
+            }
+
           ls -lh dist/*.apk
 
-      # Build AAB separately so Gradle can apply the project's bundle configuration.
-      - name: Build Google Play App Bundle
-        run: ./gradlew --no-daemon --warning-mode all :app:bundleRelease
+      # --------------------------------------------------
+      # 17. BUILD GOOGLE PLAY AAB
+      # --------------------------------------------------
 
-      - name: Package and verify AAB and checksums
+      - name: Build Google Play AAB
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --warning-mode all \
+            :app:bundleRelease
+
+      # --------------------------------------------------
+      # 18. VERIFY AAB
+      # --------------------------------------------------
+
+      - name: Package AAB and generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.name }}'
-          VERSION_CODE='${{ steps.version.outputs.code }}'
+
+          VERSION="${{ steps.version.outputs.name }}"
 
           AAB_SOURCE="app/build/outputs/bundle/release/app-release.aab"
 
           [[ -s "$AAB_SOURCE" ]] || {
-            echo "::error::Missing AAB: $AAB_SOURCE"
+            echo "::error::AAB was not generated"
             exit 1
           }
 
           AAB="dist/ZedSecure-$VERSION.aab"
+
           cp "$AAB_SOURCE" "$AAB"
 
-          unzip -t "$AAB" >/dev/null
-          AAB_ENTRIES="$(unzip -Z1 "$AAB")"
+          unzip -tq "$AAB"
 
-          grep -Fxq 'base/manifest/AndroidManifest.xml' <<< "$AAB_ENTRIES" || {
-            echo "::error::AAB is missing the base manifest"
-            exit 1
-          }
+          CONTENT="$(unzip -Z1 "$AAB")"
 
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            if ! grep -Eq "^base/lib/$abi/[^/]+\.so$" <<< "$AAB_ENTRIES"; then
-              echo "::error::AAB has no native libraries for $abi"
-              exit 1
-            fi
+
+            for lib in \
+              libtor.so \
+              libobfs4proxy.so \
+              libconjure.so \
+              libsnowflake.so \
+              libsnispoof.so \
+              libhev-socks5-tunnel.so \
+              libzeptun.so \
+              libzeptun-jni.so; do
+
+              grep -Fxq "base/lib/$abi/$lib" <<< "$CONTENT" || {
+                echo "::error::AAB missing $abi/$lib"
+                exit 1
+              }
+
+            done
+
           done
 
-          cp zedcore-build-provenance.txt dist/BUILD-INFO-zedcore.txt
+          # Build provenance
 
-          ( cd dist && sha256sum ZedSecure-* > SHA256SUMS-android.txt )
+          cat > dist/BUILD-INFO-android.txt <<EOF
+          ZedSecure version: $VERSION
 
-          echo "AAB native libraries:"
-          grep -E '^base/lib/(arm64-v8a|armeabi-v7a|x86_64)/.*\.so$' <<< "$AAB_ENTRIES" | sort
+          ZedSecure-Cores ref: $CORES_REF
+          ZedSecure-Cores commit: $CORES_COMMIT
 
-          echo "Release files:"
+          zedcore.aar SHA256: $AAR_SHA
+
+          Tor: $TOR_VERSION
+          OpenSSL: $OPENSSL_VERSION
+          Libevent: $LIBEVENT_VERSION
+
+          SNI Spoof: $SNISPOOF_VERSION
+          SNI source commit: $SNISPOOF_COMMIT
+
+          HEV: $HEV_VERSION
+          HEV source commit: $HEV_COMMIT
+
+          Zeptun: $ZEPTUN_VERSION
+          Zeptun source commit: $ZEPTUN_COMMIT
+
+          Go for ZedCore: 1.27.3
+          Go for Tor transports: 1.24
+          Go for SNI Spoof: 1.26.3
+
+          Zig: $ZIG_VERSION
+          Android NDK: $ANDROID_NDK_VERSION
+          Android API: 37
+          EOF
+
+          (
+            cd dist
+            sha256sum ZedSecure-* > SHA256SUMS-android.txt
+          )
+
+          echo "Final release files:"
           ls -lh dist
 
-          echo "SHA-256 checksums:"
+          echo "SHA256:"
           cat dist/SHA256SUMS-android.txt
+
+      # --------------------------------------------------
+      # 19. REMOVE SIGNING MATERIAL
+      # --------------------------------------------------
 
       - name: Remove signing material
         if: always()
@@ -585,7 +1233,11 @@ jobs:
           shred -u release.keystore keystore.properties 2>/dev/null || \
             rm -f release.keystore keystore.properties
 
-      - name: Upload arm64-v8a APK
+      # --------------------------------------------------
+      # 20. UPLOAD ARTIFACTS
+      # --------------------------------------------------
+
+      - name: Upload ARM64 APK
         uses: actions/upload-artifact@v7
         with:
           name: ZedSecure-${{ steps.version.outputs.name }}-arm64-v8a
@@ -604,7 +1256,7 @@ jobs:
       - name: Upload Google Play AAB
         uses: actions/upload-artifact@v7
         with:
-          name: ZedSecure-${{ steps.version.outputs.name }}-GooglePlay-bundle
+          name: ZedSecure-${{ steps.version.outputs.name }}-GooglePlay
           path: dist/ZedSecure-${{ steps.version.outputs.name }}.aab
           if-no-files-found: error
           retention-days: 30
@@ -617,25 +1269,41 @@ jobs:
             dist/ZedSecure-${{ steps.version.outputs.name }}-armeabi-v7a.apk
             dist/ZedSecure-${{ steps.version.outputs.name }}-x86_64.apk
             dist/SHA256SUMS-android.txt
-            dist/BUILD-INFO-zedcore.txt
+            dist/BUILD-INFO-android.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APKs, AAB and checksums to GitHub Releases
+      # --------------------------------------------------
+      # 21. PUBLISH GITHUB RELEASE
+      # --------------------------------------------------
+
+      - name: Publish Android Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+
           TAG="v${{ steps.version.outputs.name }}-b${{ steps.version.outputs.code }}"
 
-          echo "Publishing ZedSecure ${{ steps.version.outputs.name }} as $TAG"
+          echo "Publishing $TAG"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
+
             gh release upload "$TAG" dist/* --clobber
+
           else
+
             gh release create "$TAG" dist/* \
               --target "$GITHUB_SHA" \
               --title "ZedSecure v${{ steps.version.outputs.name }}" \
-              --notes "Android release: split APKs, ARM universal APK, Google Play AAB and SHA-256 checksums."
+              --notes "Android source-built release.
+
+          Includes:
+          - ABI split APKs
+          - Universal APK
+          - Google Play AAB
+          - SHA256 checksums
+          - Native engine build provenance"
+
           fi
