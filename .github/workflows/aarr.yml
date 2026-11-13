@@ -1,0 +1,891 @@
+name: unified-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unified-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # 1. DNS Tunnels (zeddns + MasterDNS)
+  # =========================================================================
+  dns-tunnels:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+      
+      - name: Fetch pinned repositories (Inline fetch.sh)
+        run: |
+          set -euo pipefail
+          fetch_pins() {
+            local wanted="$*"
+            while read -r path url rev; do
+              case "$path" in ''|\#*) continue ;; esac
+              if [ -n "$wanted" ]; then
+                keep=0
+                for w in $wanted; do [ "$w" = "$path" ] && keep=1; done
+                [ "$keep" = 1 ] || continue
+              fi
+              dest="$GITHUB_WORKSPACE/$path"
+              if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$rev" ]; then
+                echo "== $path already at $rev"
+                continue
+              fi
+              echo "== $path <- $url @ $rev"
+              rm -rf "$dest"
+              mkdir -p "$(dirname "$dest")"
+              git clone -q --filter=blob:none "$url" "$dest"
+              git -C "$dest" checkout -q "$rev"
+            done < "$GITHUB_WORKSPACE/pins.txt"
+          }
+          fetch_pins vendor/AndroidLibXrayLite reference/vaydns reference/MasterDnsVPN
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.3"
+          cache-dependency-path: |
+            vendor/AndroidLibXrayLite/zeddns/go.sum
+            reference/MasterDnsVPN/go.sum
+
+      - name: zeddns and the MasterDNS client for every desktop
+        run: |
+          set -e
+          mkdir -p dist
+          for t in "linux amd64 -linux" "windows amd64 -windows.exe" "darwin arm64 -macos-arm64" "darwin amd64 -macos-x86_64"; do
+            set -- $t
+            (cd vendor/AndroidLibXrayLite/zeddns && CGO_ENABLED=0 GOOS=$1 GOARCH=$2 \
+              go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/zeddns$3" ./cmd/zeddns)
+            (cd reference/MasterDnsVPN && CGO_ENABLED=0 GOOS=$1 GOARCH=$2 \
+              go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/masterdns$3" ./cmd/client)
+          done
+          ls -l dist
+
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="dns-tunnels-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from CluvexStudio/ZedSecure-Cores" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 2. HEV Socks5 Tunnel
+  # =========================================================================
+  hev:
+    runs-on: ubuntu-24.04
+    env:
+      HEV: "2.18.0"
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - name: hev-socks5-tunnel as the JNI library the Android app loads
+        run: |
+          set -e
+          git clone -q --depth 1 --branch "$HEV" --recursive https://github.com/heiher/hev-socks5-tunnel hev/jni
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          "$NDK/ndk-build" -C hev -j"$(nproc)" APP_ABI="arm64-v8a armeabi-v7a x86_64" APP_MODULES=hev-socks5-tunnel APP_PLATFORM=android-24
+          mkdir -p dist
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            so="hev/libs/$abi/libhev-socks5-tunnel.so"
+            readelf -h "$so" | grep -q 'DYN (Shared object file)' || { echo "::error::$abi: hev is not a shared library"; exit 1; }
+            readelf --dyn-syms -W "$so" | grep -qw JNI_OnLoad || { echo "::error::$abi: hev has no JNI_OnLoad"; exit 1; }
+            grep -aq 'hev/htproxy/TProxyService' "$so" || { echo "::error::$abi: hev does not bind hev.htproxy.TProxyService"; exit 1; }
+            if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then echo "::error::$abi: hev uses RELR relocations, which Android 7 and 8 cannot load"; exit 1; fi
+            ( cd "hev/libs/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/hev-android-$abi.zip" libhev-socks5-tunnel.so )
+          done
+
+      - name: The desktop builds from the hev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release download "$HEV" --repo heiher/hev-socks5-tunnel --dir up --clobber \
+            --pattern "hev-socks5-tunnel-linux-x86_64" --pattern "hev-socks5-tunnel-win64.zip" \
+            --pattern "hev-socks5-tunnel-darwin-arm64" --pattern "hev-socks5-tunnel-darwin-x86_64"
+          cp up/hev-socks5-tunnel-linux-x86_64 dist/hev-linux
+          cp up/hev-socks5-tunnel-darwin-arm64 dist/hev-macos-arm64
+          cp up/hev-socks5-tunnel-darwin-x86_64 dist/hev-macos-x86_64
+          unzip -q -o up/hev-socks5-tunnel-win64.zip -d win64
+          mkdir -p windows
+          for f in hev-socks5-tunnel.exe msys-2.0.dll wintun.dll; do
+            src=$(find win64 -type f -name "$f" | head -1)
+            [ -n "$src" ] || { echo "::error::$f is missing from the hev Windows release"; exit 1; }
+            cp "$src" "windows/$f"
+          done
+          ( cd windows && zip -q -X "$GITHUB_WORKSPACE/dist/hev-windows.zip" ./* )
+          chmod +x dist/hev-linux dist/hev-macos-*
+          ls -l dist
+
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="hev-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from CluvexStudio/ZedSecure-Cores" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 3. OpenConnect
+  # =========================================================================
+  openconnect-windows:
+    runs-on: ubuntu-24.04
+    container: fedora:42
+    env:
+      OPENCONNECT: "9.21"
+      OPENCONNECT_SHA256: "5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58"
+    steps:
+      - name: OpenConnect for Windows, cross-compiled with MinGW
+        run: |
+          set -e
+          dnf -y -q install curl unzip zip findutils make pkgconf-pkg-config \
+            mingw64-filesystem mingw64-gcc mingw64-binutils mingw64-gnutls mingw64-libxml2 mingw64-zlib \
+            mingw64-gettext mingw64-p11-kit
+          curl -fsSL --retry 3 "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT}.tar.gz" -o oc.tar.gz
+          echo "${OPENCONNECT_SHA256}  oc.tar.gz" | sha256sum -c
+          tar -xzf oc.tar.gz
+          cd "openconnect-${OPENCONNECT}"
+          mingw64-configure --without-gnutls-version-check --disable-nls --with-vpnc-script=vpnc-script-win.js
+          make -j"$(nproc)" openconnect.exe
+          out="$GITHUB_WORKSPACE/openconnect-windows"
+          mkdir -p "$out"
+          cp .libs/openconnect.exe "$out/" 2>/dev/null || cp openconnect.exe "$out/"
+          cp .libs/libopenconnect-*.dll "$out/" 2>/dev/null || true
+          sysroot=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
+          queue="$out/openconnect.exe $(ls "$out"/*.dll 2>/dev/null || true)"
+          while [ -n "$queue" ]; do
+            next=""
+            for f in $queue; do
+              for dll in $(x86_64-w64-mingw32-objdump -p "$f" | awk '/DLL Name:/ {print $3}'); do
+                src="$sysroot/$dll"
+                if [ -f "$src" ] && [ ! -f "$out/$dll" ]; then cp "$src" "$out/"; next="$next $out/$dll"; fi
+              done
+            done
+            queue="$next"
+          done
+          curl -fsSL --retry 3 https://www.wintun.net/builds/wintun-0.14.1.zip -o /tmp/wintun.zip
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  /tmp/wintun.zip" | sha256sum -c
+          unzip -o -j -d "$out" /tmp/wintun.zip wintun/bin/amd64/wintun.dll
+          curl -fsSL --retry 3 https://gitlab.com/openconnect/vpnc-scripts/raw/master/vpnc-script-win.js -o "$out/vpnc-script-win.js"
+          grep -q "WScript" "$out/vpnc-script-win.js" || { echo "::error::vpnc-script-win.js did not download"; exit 1; }
+          cp COPYING.LGPL "$out/openconnect-LICENSE.txt"
+          ( cd "$out" && ls -1 | grep -v '^files.txt$' | sort > files.txt && cat files.txt )
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          ( cd "$out" && zip -q -X "$GITHUB_WORKSPACE/dist/openconnect-windows.zip" ./* )
+          ls -l "$GITHUB_WORKSPACE/dist"
+      - uses: actions/upload-artifact@v7
+        with: { name: openconnect-windows, path: dist/*, retention-days: 3 }
+
+  openconnect-publish:
+    needs: openconnect-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout our repository for publishing
+        uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { path: dist, merge-multiple: true }
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="openconnect-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from upstream" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 4. Psiphon
+  # =========================================================================
+  psiphon:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - name: Fetch psiphon (Inline fetch.sh)
+        run: |
+          set -euo pipefail
+          fetch_pins() {
+            local wanted="$*"
+            while read -r path url rev; do
+              case "$path" in ''|\#*) continue ;; esac
+              if [ -n "$wanted" ]; then
+                keep=0
+                for w in $wanted; do [ "$w" = "$path" ] && keep=1; done
+                [ "$keep" = 1 ] || continue
+              fi
+              dest="$GITHUB_WORKSPACE/$path"
+              if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$rev" ]; then
+                echo "== $path already at $rev"
+                continue
+              fi
+              echo "== $path <- $url @ $rev"
+              rm -rf "$dest"
+              mkdir -p "$(dirname "$dest")"
+              git clone -q --filter=blob:none "$url" "$dest"
+              git -C "$dest" checkout -q "$rev"
+            done < "$GITHUB_WORKSPACE/pins.txt"
+          }
+          fetch_pins reference/psiphon-tunnel-core
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.3"
+          cache-dependency-path: reference/psiphon-tunnel-core/go.sum
+
+      - name: The Psiphon console client for every desktop
+        working-directory: reference/psiphon-tunnel-core/ConsoleClient
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for t in "linux amd64 -linux" "windows amd64 -windows.exe" "darwin arm64 -macos-arm64" "darwin amd64 -macos-x86_64"; do
+            set -- $t
+            CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/psiphon$3" .
+          done
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="psiphon-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from CluvexStudio/ZedSecure-Cores" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 5. SNI-Spoof
+  # =========================================================================
+  snispoof:
+    runs-on: ubuntu-24.04
+    env:
+      SNISPOOF: "v0.7.2"
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - uses: actions/setup-go@v7
+        with: { go-version: "1.26.3", cache: false }
+
+      - name: SNI-spoof for every ABI
+        run: |
+          set -e
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          git clone -q --depth 1 -b "$SNISPOOF" https://github.com/aleskxyz/SNI-Spoofing-Go.git src
+          mkdir -p dist
+          for triple in "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+                        "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+                        "amd64:x86_64:x86_64-linux-android24-clang"; do
+            arch=${triple%%:*}; rest=${triple#*:}; abi=${rest%%:*}; cc=${rest#*:}
+            mkdir -p "out/$abi"
+            ( cd src && CGO_ENABLED=1 CC="$BIN/$cc" GOOS=android GOARCH=$arch GOARM=7 \
+                go build -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" -o "$GITHUB_WORKSPACE/out/$abi/libsnispoof.so" . )
+            chmod +x "out/$abi/libsnispoof.so"
+            ( cd "out/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/snispoof-android-$abi.zip" libsnispoof.so )
+          done
+          ls -l dist
+
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="snispoof-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from CluvexStudio/ZedSecure-Cores" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 6. Tor (Android + Desktop)
+  # =========================================================================
+  tor-android:
+    runs-on: ubuntu-24.04
+    env:
+      SNOWFLAKE: "v2.14.1"
+      CONJURE: "v0.0.0-20260113185639-0090962226b8"
+      LYREBIRD: "v0.0.0-20260115133752-0b10edbb61e0"
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - uses: actions/setup-go@v7
+        with: { go-version: "1.24", cache: false }
+
+      - name: Tor with fake SNI (Inline build-tor-android.sh)
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          TOR_VERSION="0.4.9.13"
+          OPENSSL_VERSION="3.6.5"
+          LIBEVENT_VERSION="2.1.12-stable"
+          API="24"
+          ABIS="arm64-v8a armeabi-v7a x86_64"
+          OUT="$ROOT/out"
+          WORK="$RUNNER_TEMP/tor-build"
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          JOBS="$(nproc)"
+
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export ANDROID_NDK_ROOT="$NDK"
+
+          mkdir -p "$WORK/src" "$OUT"
+          fetch() {
+            [ -f "$WORK/src/$2" ] || curl -fsSL --retry 3 -o "$WORK/src/$2" "$1"
+          }
+          fetch "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" "openssl.tar.gz"
+          fetch "https://github.com/libevent/libevent/releases/download/release-$LIBEVENT_VERSION/libevent-$LIBEVENT_VERSION.tar.gz" "libevent.tar.gz"
+          fetch "https://archive.torproject.org/tor-package-archive/tor-$TOR_VERSION.tar.gz" "tor.tar.gz"
+
+          for abi in $ABIS; do
+            case "$abi" in
+              arm64-v8a) ossl=android-arm64; host=aarch64-linux-android; cc=aarch64-linux-android$API-clang ;;
+              armeabi-v7a) ossl=android-arm; host=arm-linux-androideabi; cc=armv7a-linux-androideabi$API-clang ;;
+              x86_64) ossl=android-x86_64; host=x86_64-linux-android; cc=x86_64-linux-android$API-clang ;;
+              *) echo "unknown ABI $abi" >&2; exit 1 ;;
+            esac
+            build="$WORK/$abi"
+            prefix="$build/prefix"
+            rm -rf "$build" && mkdir -p "$build" "$prefix"
+            export CC="$cc" AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
+
+            tar -xzf "$WORK/src/openssl.tar.gz" -C "$build"
+            (cd "$build/openssl-$OPENSSL_VERSION" &&
+              ./Configure "$ossl" -D__ANDROID_API__="$API" no-shared no-tests no-docs no-apps no-module \
+                --prefix="$prefix" --libdir=lib > "$build/openssl.log" 2>&1 &&
+              make -j"$JOBS" build_libs >> "$build/openssl.log" 2>&1 &&
+              make install_dev >> "$build/openssl.log" 2>&1) || { tail -40 "$build/openssl.log"; exit 1; }
+
+            tar -xzf "$WORK/src/libevent.tar.gz" -C "$build"
+            (cd "$build/libevent-$LIBEVENT_VERSION" &&
+              ./configure --host="$host" --prefix="$prefix" --disable-shared --enable-static --disable-openssl \
+                --disable-samples --disable-libevent-regress --disable-debug-mode > "$build/libevent.log" 2>&1 &&
+              make -j"$JOBS" >> "$build/libevent.log" 2>&1 &&
+              make install >> "$build/libevent.log" 2>&1) || { tail -40 "$build/libevent.log"; exit 1; }
+
+            tar -xzf "$WORK/src/tor.tar.gz" -C "$build"
+            (cd "$build/tor-$TOR_VERSION" &&
+              patch -p1 < "$ROOT/patches/tor-fake-sni.patch" > "$build/tor.log" 2>&1 &&
+              LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
+              ./configure --host="$host" \
+                --enable-static-libevent --with-libevent-dir="$prefix" \
+                --enable-static-openssl --with-openssl-dir="$prefix" \
+                --disable-asciidoc --disable-manpage --disable-html-manual --disable-unittests \
+                --disable-tool-name-check --disable-module-relay --disable-module-dirauth \
+                --disable-lzma --disable-zstd --disable-seccomp --disable-libscrypt >> "$build/tor.log" 2>&1 &&
+              make -j"$JOBS" src/app/tor >> "$build/tor.log" 2>&1) || { tail -60 "$build/tor.log"; exit 1; }
+
+            mkdir -p "$OUT/$abi"
+            cp "$build/tor-$TOR_VERSION/src/app/tor" "$OUT/$abi/libtor.so"
+            llvm-strip "$OUT/$abi/libtor.so"
+            ls -l "$OUT/$abi/libtor.so"
+          done
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            so="out/$abi/libtor.so"
+            grep -aq -- '--fake-hosts' "$so" || { echo "::error::$abi tor was built without the fake SNI patch"; exit 1; }
+            readelf -lW "$so" | awk '$1=="LOAD"{print $NF}' | grep -qv 0x4000 && { echo "::error::$abi tor is not 16 KB aligned"; exit 1; } || true
+          done
+
+      - name: lyrebird, Conjure and Snowflake built for every ABI
+        run: |
+          set -e
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          src() { go mod download -json "$1@$2" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Dir"])'; }
+          LYREBIRD_DIR=$(src gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird "$LYREBIRD")
+          CONJURE_DIR=$(src gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/conjure "$CONJURE")
+          SNOWFLAKE_DIR=$(src gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2 "$SNOWFLAKE")
+          [ -d "$LYREBIRD_DIR/cmd/lyrebird" ] && [ -d "$CONJURE_DIR/client" ] && [ -d "$SNOWFLAKE_DIR/client" ] || { echo "::error::a transport did not come through the Go module proxy"; exit 1; }
+          for triple in "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+                        "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+                        "amd64:x86_64:x86_64-linux-android24-clang"; do
+            arch=${triple%%:*}; rest=${triple#*:}; abi=${rest%%:*}; cc=${rest#*:}
+            export CGO_ENABLED=1 CC="$BIN/$cc" GOOS=android GOARCH=$arch GOARM=7
+            ( cd "$LYREBIRD_DIR" && go build -trimpath -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" -o "$GITHUB_WORKSPACE/out/$abi/libobfs4proxy.so" ./cmd/lyrebird )
+            ( cd "$CONJURE_DIR" && go build -trimpath -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" -o "$GITHUB_WORKSPACE/out/$abi/libconjure.so" ./client )
+            ( cd "$SNOWFLAKE_DIR" && go build -trimpath -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" -o "$GITHUB_WORKSPACE/out/$abi/libsnowflake.so" ./client )
+          done
+
+      - name: One zip per ABI
+        run: |
+          set -e
+          mkdir -p dist
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            for lib in libtor libobfs4proxy libconjure libsnowflake; do
+              [ -s "out/$abi/$lib.so" ] || { echo "::error::$abi/$lib.so is missing"; exit 1; }
+              readelf -lW "out/$abi/$lib.so" | awk '$1=="LOAD"{print $NF}' | grep -qv 0x4000 && { echo "::error::$abi/$lib.so is not 16 KB aligned"; exit 1; } || true
+            done
+            chmod +x out/"$abi"/*.so
+            ( cd "out/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/tor-android-$abi.zip" libtor.so libobfs4proxy.so libconjure.so libsnowflake.so )
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with: { name: tor-android, path: dist/*, retention-days: 3 }
+
+  tor-desktop:
+    runs-on: ubuntu-24.04
+    env:
+      DESKTOP_BUNDLE: "15.0.24"
+    steps:
+      - name: Tor, lyrebird and Conjure from the official desktop bundles
+        run: |
+          set -e
+          mkdir -p dist
+          for pair in "linux-x86_64 tor-linux" "windows-x86_64 tor-windows" \
+                      "macos-aarch64 tor-macos-arm64" "macos-x86_64 tor-macos-x86_64"; do
+            set -- $pair
+            rm -rf teb "$2" && mkdir teb "$2" "$2/pt"
+            curl -fsSL --retry 3 "https://archive.torproject.org/tor-package-archive/torbrowser/${DESKTOP_BUNDLE}/tor-expert-bundle-$1-${DESKTOP_BUNDLE}.tar.gz" | tar -xz -C teb
+            find teb/tor -maxdepth 1 -type f -exec cp {} "$2/" \;
+            for pt in lyrebird lyrebird.exe conjure-client conjure-client.exe; do
+              [ -f "teb/tor/pluggable_transports/$pt" ] && cp "teb/tor/pluggable_transports/$pt" "$2/pt/"
+            done
+            cp teb/data/geoip teb/data/geoip6 "$2/"
+            ls "$2" | grep -q -E '^tor(\.exe)?$' || { echo "::error::$1 has no tor binary"; exit 1; }
+            ls "$2/pt" | grep -q -E '^lyrebird(\.exe)?$' || { echo "::error::$1 has no lyrebird"; exit 1; }
+            chmod +x "$2"/* "$2"/pt/* 2>/dev/null || true
+            ( cd "$2" && zip -q -r -X "$GITHUB_WORKSPACE/dist/$2.zip" . )
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with: { name: tor-desktop, path: dist/*, retention-days: 3 }
+
+  tor-publish:
+    needs: [tor-android, tor-desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout our repository for publishing
+        uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { path: dist, merge-multiple: true }
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="tor-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from upstream" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 7. Xray
+  # =========================================================================
+  xray-linux-windows:
+    runs-on: ubuntu-24.04
+    env:
+      LDFLAGS: "-checklinkname=0 -s -w -X runtime.godebugDefault=multipathtcp=0,tlssha1=1"
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - name: Fetch xray components (Inline fetch.sh)
+        run: |
+          set -euo pipefail
+          fetch_pins() {
+            local wanted="$*"
+            while read -r path url rev; do
+              case "$path" in ''|\#*) continue ;; esac
+              if [ -n "$wanted" ]; then
+                keep=0
+                for w in $wanted; do [ "$w" = "$path" ] && keep=1; done
+                [ "$keep" = 1 ] || continue
+              fi
+              dest="$GITHUB_WORKSPACE/$path"
+              if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$rev" ]; then
+                echo "== $path already at $rev"
+                continue
+              fi
+              echo "== $path <- $url @ $rev"
+              rm -rf "$dest"
+              mkdir -p "$(dirname "$dest")"
+              git clone -q --filter=blob:none "$url" "$dest"
+              git -C "$dest" checkout -q "$rev"
+            done < "$GITHUB_WORKSPACE/pins.txt"
+          }
+          fetch_pins vendor/xray-core reference/amneziawg-go reference/sing-openvpn
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: vendor/xray-core/go.sum
+
+      - name: Xray with every protocol for Linux and Windows, plus cronet
+        working-directory: vendor/xray-core
+        run: |
+          set -e
+          out="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$out"
+          TAGS="$(paste -sd, "$GITHUB_WORKSPACE/singbox-tags.txt"),with_purego"
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o "$out/xray-linux"       ./main
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o "$out/xray-windows.exe" ./main
+          go mod download github.com/sagernet/cronet-go/lib/linux_amd64 github.com/sagernet/cronet-go/lib/windows_amd64
+          lin=$(go list -m -f '{{.Dir}}' github.com/sagernet/cronet-go/lib/linux_amd64)
+          win=$(go list -m -f '{{.Dir}}' github.com/sagernet/cronet-go/lib/windows_amd64)
+          [ -n "$lin" ] && [ -n "$win" ] || { echo "::error::cronet modules did not resolve"; exit 1; }
+          cp "$lin/libcronet.so"  "$out/"
+          cp "$win/libcronet.dll" "$out/"
+          "$out/xray-linux" version | head -1
+          ls -l "$out"
+      - uses: actions/upload-artifact@v7
+        with: { name: xray-linux-windows, path: dist/*, retention-days: 3 }
+
+  xray-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-26, arch: arm64 }
+          - { runner: macos-26-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      LDFLAGS: "-checklinkname=0 -s -w -X runtime.godebugDefault=multipathtcp=0,tlssha1=1"
+    steps:
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - name: Fetch xray components (Inline fetch.sh)
+        run: |
+          set -euo pipefail
+          fetch_pins() {
+            local wanted="$*"
+            while read -r path url rev; do
+              case "$path" in ''|\#*) continue ;; esac
+              if [ -n "$wanted" ]; then
+                keep=0
+                for w in $wanted; do [ "$w" = "$path" ] && keep=1; done
+                [ "$keep" = 1 ] || continue
+              fi
+              dest="$GITHUB_WORKSPACE/$path"
+              if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$rev" ]; then
+                echo "== $path already at $rev"
+                continue
+              fi
+              echo "== $path <- $url @ $rev"
+              rm -rf "$dest"
+              mkdir -p "$(dirname "$dest")"
+              git clone -q --filter=blob:none "$url" "$dest"
+              git -C "$dest" checkout -q "$rev"
+            done < "$GITHUB_WORKSPACE/pins.txt"
+          }
+          fetch_pins vendor/xray-core reference/amneziawg-go reference/sing-openvpn
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: vendor/xray-core/go.sum
+
+      - name: Xray with every protocol for macOS, cronet linked in
+        working-directory: vendor/xray-core
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          CGO_CFLAGS: "-mmacosx-version-min=12.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+        run: |
+          set -e
+          out="$GITHUB_WORKSPACE/dist"
+          bin="$out/xray-macos-${{ matrix.arch }}"
+          mkdir -p "$out"
+          TAGS="$(paste -sd, "$GITHUB_WORKSPACE/singbox-tags.txt")"
+          CGO_ENABLED=1 go build -trimpath -tags "$TAGS" -ldflags="$LDFLAGS" -o "$bin" ./main
+          file "$bin"
+          minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
+          echo "minimum macOS: $minos"
+          [ "$minos" = "12.0" ] || { echo "::error::xray needs macOS $minos, not 12.0"; exit 1; }
+          "$bin" version | head -1
+      - uses: actions/upload-artifact@v7
+        with: { name: "xray-macos-${{ matrix.arch }}", path: dist/*, retention-days: 3 }
+
+  xray-publish:
+    needs: [xray-linux-windows, xray-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout our repository for publishing
+        uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { path: dist, merge-multiple: true }
+      - name: Force Publish to Our Repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          tag="xray-r${{ github.run_number }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Automated build from CluvexStudio/ZedSecure-Cores" --latest=false ./*
+          fi
+
+  # =========================================================================
+  # 8. Zedcore (AAR)
+  # =========================================================================
+  zedcore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Make room
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/node_modules /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+                      "$AGENT_TOOLSDIRECTORY/CodeQL" "$AGENT_TOOLSDIRECTORY/PyPy" \
+                      "$AGENT_TOOLSDIRECTORY/Ruby" /usr/local/.ghcup || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Checkout upstream source repository
+        uses: actions/checkout@v7
+        with:
+          repository: 'CluvexStudio/ZedSecure-Cores'
+          ref: 'main'
+
+      - name: Fetch all pinned repos (Inline fetch.sh)
+        run: |
+          set -euo pipefail
+          while read -r path url rev; do
+            case "$path" in ''|\#*) continue ;; esac
+            dest="$GITHUB_WORKSPACE/$path"
+            if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$rev" ]; then
+              echo "== $path already at $rev"
+              continue
+            fi
+            echo "== $path <- $url @ $rev"
+            rm -rf "$dest"
+            mkdir -p "$(dirname "$dest")"
+            git clone -q --filter=blob:none "$url" "$dest"
+            git -C "$dest" checkout -q "$rev"
+          done < "$GITHUB_WORKSPACE/pins.txt"
+
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: "21" }
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: vendor/AndroidLibXrayLite/go.sum
+
+      - name: Install an NDK that can link cronet
+        run: |
+          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358"
+          newest=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -1)
+          case "$newest" in
+            2[0-7].*) echo "::error::still on NDK $newest; its linker cannot read the cronet archive"; exit 1 ;;
+          esac
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$newest" >> "$GITHUB_ENV"
+          for old in $(ls -1 "$ANDROID_HOME/ndk" | grep -v "^$newest$"); do
+            sudo rm -rf "$ANDROID_HOME/ndk/$old"
+          done
+          echo "building with NDK $newest"
+          df -h / | tail -1
+
+      - name: gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Build zedcore.aar (Inline build-zedcore.sh)
+        env:
+          ZEDCORE_TMPDIR: ${{ runner.temp }}/zedcore
+        run: |
+          set -e -u -x
+          ROOT="$GITHUB_WORKSPACE"
+          export GOTOOLCHAIN=go1.27.3
+          export PATH="$HOME/go/bin:$PATH"
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          ANDROID_API=24
+          PSI_DIR="$ROOT/reference/psiphon-tunnel-core/MobileLibrary/Android"
+
+          pick_newest() { ls -d "$1"/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/*$::'; }
+
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(pick_newest "$ANDROID_HOME/ndk")}"
+          [ -d "$ANDROID_NDK_HOME" ] || { echo "no NDK under $ANDROID_HOME/ndk" >&2; exit 1; }
+
+          ANDROID_JAR="$(ls "$ANDROID_HOME"/platforms/*/android.jar 2>/dev/null | sort -V | tail -1)"
+          [ -f "$ANDROID_JAR" ] || { echo "no android.jar under $ANDROID_HOME/platforms" >&2; exit 1; }
+
+          export TMPDIR="${ZEDCORE_TMPDIR:-$HOME/.cache/zedcore-build-tmp}"
+          export GOTMPDIR="$TMPDIR"
+          mkdir -p "$TMPDIR"
+
+          echo ">>> ndk=$ANDROID_NDK_HOME"
+          echo ">>> jdk=$JAVA_HOME"
+          echo ">>> android.jar=$ANDROID_JAR"
+
+          export CGO_LDFLAGS="-Wl,-z,max-page-size=16384,-z,common-page-size=16384"
+          LDFLAGS="-checklinkname=0 -s -w -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -extldflags=-Wl,-z,max-page-size=16384,-z,common-page-size=16384"
+
+          SINGBOX_TAGS="$(paste -sd, "$ROOT/singbox-tags.txt")"
+          TARGETS="${TARGETS:-android/arm64,android/arm,android/amd64}"
+
+          RAW="$ROOT/out/zedcore-raw.aar"
+          OUT="$ROOT/out/zedcore.aar"
+          mkdir -p "$ROOT/out"
+
+          PTLS_MODULE="github.com/Psiphon-Labs/psiphon-tls"
+          PTLS_VERSION="$(grep -m1 "^[[:space:]]*$PTLS_MODULE " "$ROOT/vendor/AndroidLibXrayLite/go.mod" | awk '{print $2}')"
+          [ -n "$PTLS_VERSION" ] || { echo "no $PTLS_MODULE in AndroidLibXrayLite/go.mod" >&2; exit 1; }
+          PTLS_SRC="$(cd "$TMPDIR" && go mod download -json "$PTLS_MODULE@$PTLS_VERSION" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
+          [ -d "$PTLS_SRC" ] || { echo "could not download $PTLS_MODULE@$PTLS_VERSION" >&2; exit 1; }
+          PTLS_DIR="$ROOT/reference/psiphon-tls"
+          rm -rf "$PTLS_DIR"
+          cp -r "$PTLS_SRC" "$PTLS_DIR"
+          chmod -R u+w "$PTLS_DIR"
+          patch -d "$PTLS_DIR" -p1 --no-backup-if-mismatch < "$ROOT/patches/psiphon-tls-go1.27.patch"
+          ( cd "$ROOT/vendor/AndroidLibXrayLite" && go mod edit -replace "$PTLS_MODULE=../../reference/psiphon-tls" )
+
+          echo ">>> gomobile bind (Xray + sing-box + Psiphon + DNSTT + VayDNS + MasterDNS) with $(go version)"
+          cd "$ROOT/vendor/AndroidLibXrayLite"
+          gomobile bind -v -x -trimpath -androidapi "$ANDROID_API" -target="$TARGETS" -tags="$SINGBOX_TAGS" -ldflags="$LDFLAGS" -o "$RAW" \
+            github.com/2dust/AndroidLibXrayLite \
+            github.com/sagernet/sing-box/experimental/libbox \
+            github.com/Psiphon-Labs/psiphon-tunnel-core/MobileLibrary/psi \
+            zeddns \
+            masterdnsvpn-go/mobile
+
+          echo ">>> inject ca.psiphon.PsiphonTunnel"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          unzip -o "$RAW" -d "$WORK/psi" >/dev/null
+
+          "$JAVA_HOME/bin/javac" -d "$WORK" -bootclasspath "$ANDROID_JAR" -source 1.8 -target 1.8 \
+            -classpath "$WORK/psi/classes.jar" "$PSI_DIR/PsiphonTunnel/PsiphonTunnel.java"
+          ( cd "$WORK" && "$JAVA_HOME/bin/jar" uf psi/classes.jar ca/psiphon/*.class )
+
+          cat > "$WORK/psi/AndroidManifest.xml" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="ca.psiphon">
+              <uses-sdk android:minSdkVersion="24" />
+          </manifest>
+          EOF
+          rm -rf "$WORK/psi/res/xml" 2>/dev/null || true
+
+          printf -- '-keep class psi.** { *; }\n-keep class ca.psiphon.** { *; }\n-keep class libbox.** { *; }\n' >> "$WORK/psi/proguard.txt"
+
+          rm -f "$OUT.tmp"
+          ( cd "$WORK/psi" && zip -r "$OUT.tmp" ./ >/dev/null )
+          mv -f "$OUT.tmp" "$OUT"
+          rm -f "$RAW"
+          echo ">>> wrote $OUT"
+          ls -la "$OUT"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -l "$GITHUB_WORKSPACE/out/zedcore.aar" | grep -q "jni/$abi/libgojni.so" || { echo "::error::zedcore.aar has no $abi"; exit 1; }
+          done
+          mkdir -p "$GITHUB_WORKSPACE/dist" && cp "$GITHUB_WORKSPACE/out/zedcore.aar" "$GITHUB_WORKSPACE/dist/"
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Force Publish AAR to Our Release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -f "$GITHUB_WORKSPACE/dist/zedcore.aar" ] || { echo "::error::AAR file was not produced!"; exit 1; }
+          
+          cd "$GITHUB_WORKSPACE/dist"
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+          TAG_NAME="zedcore-r${{ github.run_number }}"
+          RELEASE_TITLE="Zedcore Build r${{ github.run_number }}"
+
+          echo "Publishing zedcore.aar to our repository ($GITHUB_REPOSITORY)..."
+
+          # اگر تگ/ریلیز وجود نداشت ایجاد می‌کند، اگر وجود داشت فایل‌ها را با فلگ clobber بازنویسی و جایگزین می‌کند
+          if ! gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" ./* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TITLE" \
+              --notes "Automated core build from CluvexStudio/ZedSecure-Cores at $(date -u)" \
+              --latest=true
+          else
+            gh release upload "$TAG_NAME" ./* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          fi
