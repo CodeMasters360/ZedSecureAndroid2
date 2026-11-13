@@ -14,7 +14,6 @@ on:
         type: string
         default: main
 
-# دسترسی نوشتن برای ایجاد یا آپدیت Release
 permissions:
   contents: write
 
@@ -23,18 +22,48 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
-        with: { distribution: temurin, java-version: "21" }
-      - uses: gradle/actions/setup-gradle@v5
+      # 1. Checkout source code from upstream repository
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          repository: 'CluvexStudio/ZedSecure'
+          fetch-depth: 0
 
+      # 2. Setup Java & Gradle environments
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v3
+
+      # 3. Read version name from gradle.properties
       - name: Read the version
         id: v
-        run: echo "name=$(grep '^zedsecure.versionName=' gradle.properties | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(grep '^zedsecure.versionName=' gradle.properties | cut -d= -f2 | tr -d '\r\n')
+          if [ -z "$VERSION" ]; then
+            VERSION="v${{ github.run_number }}"
+          fi
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Take every engine from its own build
-        run: ./tools/get-cores.sh android
+      # 4. Download latest zedcore.aar from CodeMasters360/ZedSecureAndroid2 and extract native libraries
+      - name: Fetch zedcore.aar from our latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/libs app/src/main/jniLibs
+          echo "Downloading latest zedcore.aar from CodeMasters360/ZedSecureAndroid2..."
+          gh release download --repo CodeMasters360/ZedSecureAndroid2 --pattern "zedcore.aar" --dir app/libs --clobber
+          
+          # Extract JNI libraries from aar to satisfy the engine check
+          mkdir -p /tmp/aar_unpacked
+          unzip -q -o app/libs/zedcore.aar "jni/*" -d /tmp/aar_unpacked || true
+          if [ -d "/tmp/aar_unpacked/jni" ]; then
+            cp -rf /tmp/aar_unpacked/jni/* app/src/main/jniLibs/
+          fi
+          rm -rf /tmp/aar_unpacked
 
+      # 5. Sanity checks on core engines
       - name: Check the engines
         run: |
           set -e
@@ -55,6 +84,7 @@ jobs:
           done
           find app/src/main/jniLibs -name '*.so' | sort
 
+      # 6. Keystore configuration
       - name: Unlock signing
         env:
           USE_PLAY: ${{ inputs.signing_key != 'upload' }}
@@ -78,10 +108,12 @@ jobs:
           { echo "storeFile=release.keystore"; echo "storePassword=$STORE_PW"
             echo "keyPassword=$KEY_PW"; echo "keyAlias=$ALIAS"; } > keystore.properties
 
+      # 7. Assemble APKs
       - name: Build
         run: ./gradlew --warning-mode all :app:assembleRelease
 
-      - name: Name them for people
+      # 8. Align, pack universal, and sign APKs
+      - name: Name and sign APKs
         run: |
           set -e
           mkdir -p dist
@@ -113,31 +145,33 @@ jobs:
           ( cd dist && sha256sum ZedSecure-*.apk > SHA256SUMS-android.txt )
           ls -l dist
 
+      # 9. Clean up keys
       - name: Forget the key
         if: always()
         run: shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
 
-      - uses: actions/upload-artifact@v7
-        with: { name: android-apks, path: dist/*, retention-days: 30 }
-
-      # مرحله آپلود به Release
-      - name: Upload to Release (Latest or New)
+      # 10. Force upload APKs directly to GitHub Release
+      - name: Force Release to Current Repository
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          # بررسی تگ: اگر روی تگ بود همان را می‌گیرد، وگرنه تگ آخرین ریلیز ریپازیتوری را پیدا می‌کند
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            TARGET_TAG="$GITHUB_REF_NAME"
-          else
-            TARGET_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
-          fi
+          TAG_NAME="v${{ steps.v.outputs.name }}"
+          RELEASE_TITLE="ZedSecure ${{ steps.v.outputs.name }}"
 
-          if [ -n "$TARGET_TAG" ]; then
-            echo "Uploading artifacts to release: $TARGET_TAG"
-            gh release upload "$TARGET_TAG" dist/* --clobber
-          else
-            FALLBACK_TAG="v${{ steps.v.outputs.name }}"
-            echo "No existing release found. Creating release for: $FALLBACK_TAG"
-            gh release create "$FALLBACK_TAG" dist/* --title "$FALLBACK_TAG" --generate-notes
-          fi
+          echo "Publishing release $TAG_NAME..."
+          
+          # Try creating the release, if it exists, upload & overwrite (clobber) assets
+          gh release create "$TAG_NAME" dist/ZedSecure-*.apk dist/SHA256SUMS-android.txt \
+            --title "$RELEASE_TITLE" \
+            --notes "Automated build from CluvexStudio/ZedSecure source." \
+            --repo "${{ github.repository }}" || \
+          gh release upload "$TAG_NAME" dist/ZedSecure-*.apk dist/SHA256SUMS-android.txt \
+            --clobber \
+            --repo "${{ github.repository }}"
+
+      # 11. Workflow artifacts backup
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist/*
+          retention-days: 30
