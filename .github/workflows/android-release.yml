@@ -14,8 +14,9 @@ on:
         type: string
         default: main
 
+# دسترسی نوشتن برای ایجاد یا آپدیت Release
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apk:
@@ -118,3 +119,25 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with: { name: android-apks, path: dist/*, retention-days: 30 }
+
+      # مرحله آپلود به Release
+      - name: Upload to Release (Latest or New)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # بررسی تگ: اگر روی تگ بود همان را می‌گیرد، وگرنه تگ آخرین ریلیز ریپازیتوری را پیدا می‌کند
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TARGET_TAG="$GITHUB_REF_NAME"
+          else
+            TARGET_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+          fi
+
+          if [ -n "$TARGET_TAG" ]; then
+            echo "Uploading artifacts to release: $TARGET_TAG"
+            gh release upload "$TARGET_TAG" dist/* --clobber
+          else
+            FALLBACK_TAG="v${{ steps.v.outputs.name }}"
+            echo "No existing release found. Creating release for: $FALLBACK_TAG"
+            gh release create "$FALLBACK_TAG" dist/* --title "$FALLBACK_TAG" --generate-notes
+          fi
