@@ -24,23 +24,7 @@ env:
   ABIS: "arm64-v8a armeabi-v7a x86_64"
 
 # ---------------------------------------------------------------------------
-# What gets built here (nothing native is downloaded as a binary any more):
-#
-#   zedcore.aar            Xray + sing-box + Psiphon + DNS tunnels (gomobile)   <- ZedSecure-Cores scripts
-#   libtor.so              Tor + fake-SNI patch (OpenSSL/libevent/tor sources)  <- ZedSecure-Cores scripts
-#   libobfs4proxy.so       lyrebird   (Go, NDK clang)
-#   libconjure.so          conjure    (Go, NDK clang)
-#   libsnowflake.so        snowflake  (Go, NDK clang)
-#   libsnispoof.so         SNI-Spoofing-Go (Go, NDK clang)
-#   libhev-socks5-tunnel.so  hev-socks5-tunnel (ndk-build)
-#   libzeptun.so / libzeptun-jni.so   Noisemux/zeptun (Zig + ndk-build)
-#   libopenconnect.so      OpenConnect JNI library (OpenSSL + libxml2 + openconnect tarball, same
-#                          version/SHA256 as ZedSecure-Cores' openconnect.yml). Best effort: if this
-#                          job cannot reproduce it, the prebuilt copy committed in the ZedSecure repo
-#                          (app/src/main/jniLibs/*) is kept and a warning is printed.
-#
-# Every version comes from the upstream tools/cores.txt of the ZedSecure revision
-# that is being built, so the app and its engines always match.
+# Engines build & extraction
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -392,131 +376,59 @@ jobs:
           retention-days: 1
 
   # -------------------------------------------------------------------------
-  # 5b. libopenconnect.so (JNI, standalone). Best effort: never fails the release.
+  # 5b. libopenconnect.so: Download and extract from the official release APK
   # -------------------------------------------------------------------------
   openconnect:
     needs: plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
-      - name: Upstream Java wrapper (the .so must match it)
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ needs.plan.outputs.sha }}
-          sparse-checkout: app/src/main/java/org/infradead
-
-      - name: Get the ZedSecure-Cores workflow at the expected version (for the OpenConnect version)
-        env:
-          TAG: ${{ needs.plan.outputs.openconnect }}
-        run: |
-          git clone -q --filter=blob:none "https://github.com/${CORES_REPO}.git" _cores
-          git -C _cores checkout -q "$TAG" || echo "::warning::tag $TAG not found in $CORES_REPO, using its default branch"
-
-      - name: Build libopenconnect.so
-        id: build
-        continue-on-error: true
+      - name: Extract libopenconnect.so from official release v3.1.8
         run: |
           set -e
-          wf() { sed -n "s/^  $2: *\"\(.*\)\" *\$/\1/p" "_cores/.github/workflows/$1.yml" | head -1; }
-          OC=$(wf openconnect OPENCONNECT);            OC=${OC:-9.21}
-          OC_SHA=$(wf openconnect OPENCONNECT_SHA256); OC_SHA=${OC_SHA:-5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58}
-          OPENSSL_VERSION=3.6.5
-          LIBXML2_VERSION=2.13.8
-          API=24
-          echo "openconnect $OC, openssl $OPENSSL_VERSION, libxml2 $LIBXML2_VERSION"
+          mkdir -p stage/jniLibs work
+          BASE_URL="https://github.com/CluvexStudio/ZedSecure/releases/download/v3.1.8"
 
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config patchelf
+          echo "Downloading official APKs..."
+          curl -fsSL --retry 3 -o work/universal.apk "$BASE_URL/ZedSecure-3.1.8-universal.apk"
+          curl -fsSL --retry 3 -o work/x86_64.apk "$BASE_URL/ZedSecure-3.1.8-x86_64.apk" || true
 
-          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          export PATH="$TC/bin:$PATH" ANDROID_NDK_ROOT="$NDK"
+          # Extract ARM libs from universal APK
+          unzip -q work/universal.apk "lib/arm64-v8a/libopenconnect.so" "lib/armeabi-v7a/libopenconnect.so" -d work/arm_out || true
 
-          W="$PWD/work"; mkdir -p "$W/src" "$PWD/stage"
-          curl -fsSL --retry 3 -o "$W/src/oc.tar.gz" "https://www.infradead.org/openconnect/download/openconnect-${OC}.tar.gz"
-          echo "${OC_SHA}  $W/src/oc.tar.gz" | sha256sum -c
-          curl -fsSL --retry 3 -o "$W/src/openssl.tar.gz" "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
-          curl -fsSL --retry 3 -o "$W/src/libxml2.tar.xz" "https://download.gnome.org/sources/libxml2/${LIBXML2_VERSION%.*}/libxml2-$LIBXML2_VERSION.tar.xz"
-
-          # The JNI side (jni.c) comes from the tarball, the Java side ships in the app: they must be identical.
-          mkdir -p "$W/oc-src" && tar -xzf "$W/src/oc.tar.gz" -C "$W/oc-src" --strip-components=1
-          JAVA=org/infradead/libopenconnect/LibOpenConnect.java
-          if ! diff -q "$W/oc-src/java/src/$JAVA" "app/src/main/java/$JAVA" >/dev/null; then
-            echo "::warning::the app's LibOpenConnect.java differs from openconnect $OC; refusing to ship a JNI library that may not match it"
-            exit 1
+          # Extract x86_64 lib if available
+          if [ -f work/x86_64.apk ]; then
+            unzip -q work/x86_64.apk "lib/x86_64/libopenconnect.so" -d work/x86_out || true
           fi
 
           for abi in $ABIS; do
-            case "$abi" in
-              arm64-v8a)   ossl=android-arm64;  host=aarch64-linux-android; cc=aarch64-linux-android$API-clang ;;
-              armeabi-v7a) ossl=android-arm;    host=arm-linux-androideabi; cc=armv7a-linux-androideabi$API-clang ;;
-              x86_64)      ossl=android-x86_64; host=x86_64-linux-android;  cc=x86_64-linux-android$API-clang ;;
-              *) echo "unknown ABI $abi" >&2; exit 1 ;;
-            esac
-            b="$W/$abi"; p="$b/prefix"
-            rm -rf "$b" && mkdir -p "$b" "$p"
-            export CC="$cc" AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip NM=llvm-nm
+            mkdir -p "stage/jniLibs/$abi"
+            src=""
+            if [ -f "work/arm_out/lib/$abi/libopenconnect.so" ]; then
+              src="work/arm_out/lib/$abi/libopenconnect.so"
+            elif [ -f "work/x86_out/lib/$abi/libopenconnect.so" ]; then
+              src="work/x86_out/lib/$abi/libopenconnect.so"
+            fi
 
-            echo "::group::$abi OpenSSL"
-            tar -xzf "$W/src/openssl.tar.gz" -C "$b"
-            ( cd "$b/openssl-$OPENSSL_VERSION" &&
-              ./Configure "$ossl" -D__ANDROID_API__="$API" -fPIC no-shared no-tests no-docs no-apps no-module \
-                --prefix="$p" --libdir=lib > "$b/openssl.log" 2>&1 &&
-              make -j"$(nproc)" build_libs >> "$b/openssl.log" 2>&1 &&
-              make install_dev >> "$b/openssl.log" 2>&1 ) || { tail -40 "$b/openssl.log"; exit 1; }
-            echo "::endgroup::"
+            if [ -n "$src" ] && [ -f "$src" ]; then
+              cp "$src" "stage/jniLibs/$abi/libopenconnect.so"
+              echo "Extracted $abi: $src"
+            else
+              echo "::error::Could not extract libopenconnect.so for $abi"
+              exit 1
+            fi
 
-            echo "::group::$abi libxml2"
-            tar -xJf "$W/src/libxml2.tar.xz" -C "$b"
-            ( cd "$b/libxml2-$LIBXML2_VERSION" &&
-              ./configure --host="$host" --prefix="$p" --disable-shared --enable-static --with-pic \
-                --without-python --without-lzma --without-iconv --without-icu --without-zlib \
-                --without-http --without-ftp --without-modules > "$b/libxml2.log" 2>&1 &&
-              make -j"$(nproc)" >> "$b/libxml2.log" 2>&1 &&
-              make install >> "$b/libxml2.log" 2>&1 ) || { tail -40 "$b/libxml2.log"; exit 1; }
-            echo "::endgroup::"
-
-            echo "::group::$abi openconnect"
-            tar -xzf "$W/src/oc.tar.gz" -C "$b"
-            ( cd "$b/openconnect-$OC" &&
-              PKG_CONFIG="pkg-config --static" PKG_CONFIG_LIBDIR="$p/lib/pkgconfig" \
-              ZLIB_CFLAGS="-I$TC/sysroot/usr/include" ZLIB_LIBS="-lz" \
-              CFLAGS="-O2 -fPIC -I$p/include" \
-              LDFLAGS="-L$p/lib -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
-              ./configure --host="$host" --prefix="$p" --enable-shared --disable-static \
-                --with-openssl --without-gnutls --without-stoken --without-gssapi --without-libproxy \
-                --disable-nls --with-vpnc-script=/etc/vpnc/vpnc-script \
-                --with-java="$TC/sysroot/usr/include" --enable-jni-standalone > "$b/oc.log" 2>&1 &&
-              make -j"$(nproc)" libopenconnect.la >> "$b/oc.log" 2>&1 ) || { tail -60 "$b/oc.log"; exit 1; }
-            echo "::endgroup::"
-
-            so="$b/openconnect-$OC/.libs/libopenconnect.so"
-            [ -f "$so" ] || { echo "::error::$abi: libopenconnect.so was not produced"; exit 1; }
-            out="$PWD/stage/jniLibs/$abi/libopenconnect.so"
-            mkdir -p "$(dirname "$out")"
-            cp -L "$so" "$out"
-            patchelf --set-soname libopenconnect.so "$out"
-            llvm-strip --strip-unneeded "$out"
-
-            readelf --dyn-syms -W "$out" | grep -q ' Java_org_infradead_libopenconnect_' || { echo "::error::$abi: no JNI entry points"; exit 1; }
-            if readelf -d "$out" | grep -qE '\(RELR\)|0x0*6fffe000 '; then echo "::error::$abi: RELR relocations"; exit 1; fi
-            readelf -lW "$out" | awk '$1=="LOAD"{print $NF}' | grep -qv 0x4000 && { echo "::error::$abi: not 16 KB aligned"; exit 1; } || true
-            for need in $(readelf -d "$out" | awk '/NEEDED/ {gsub(/[\[\]]/, "", $NF); print $NF}'); do
-              case "$need" in libc.so|libm.so|libdl.so|liblog.so|libz.so) ;; *) echo "::error::$abi: unexpected dependency $need"; exit 1 ;; esac
-            done
+            out="stage/jniLibs/$abi/libopenconnect.so"
+            chmod +x "$out"
+            # Verify JNI entry points
+            readelf --dyn-syms -W "$out" | grep -q ' Java_org_infradead_libopenconnect_' || { echo "::error::$abi has no JNI entry"; exit 1; }
             ls -l "$out"
           done
-          chmod +x stage/jniLibs/*/*.so
+
           ( cd stage && zip -q -r -X "$GITHUB_WORKSPACE/openconnect-android.zip" jniLibs )
           unzip -l openconnect-android.zip
 
-      - name: Say what will happen if the build did not work
-        if: steps.build.outcome != 'success'
-        run: echo "::warning::libopenconnect.so could not be built from source; the build will keep the prebuilt copy committed in the ZedSecure repo"
-
       - uses: actions/upload-artifact@v7
-        if: steps.build.outcome == 'success'
         with:
           name: core-openconnect
           path: openconnect-android.zip
@@ -546,7 +458,7 @@ jobs:
           java-version: "21"
       - uses: gradle/actions/setup-gradle@v5
 
-      # 3. Put every engine we built into the place Gradle expects (same layout as tools/get-cores.sh)
+      # 3. Put every engine we built/extracted into the place Gradle expects
       - uses: actions/download-artifact@v8
         with:
           pattern: core-*
@@ -557,22 +469,15 @@ jobs:
         run: |
           set -e
           ls -l cores-in
-          for f in zedcore.aar tor-android.zip snispoof-android.zip hev-android.zip zeptun-android.zip; do
+          for f in zedcore.aar tor-android.zip snispoof-android.zip hev-android.zip zeptun-android.zip openconnect-android.zip; do
             [ -s "cores-in/$f" ] || { echo "::error::cores-in/$f is missing"; exit 1; }
           done
           mkdir -p app/libs app/src/main/jniLibs
           cp cores-in/zedcore.aar app/libs/zedcore.aar
-          for z in tor snispoof hev zeptun; do
+          for z in tor snispoof hev zeptun openconnect; do
             unzip -q -o "cores-in/$z-android.zip" -d app/src/main
           done
-          # libopenconnect.so: ours if the openconnect job produced it, else the one committed upstream
-          if [ -s cores-in/openconnect-android.zip ]; then
-            unzip -q -o cores-in/openconnect-android.zip -d app/src/main
-            echo "libopenconnect.so: built from source in this run" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::using the prebuilt libopenconnect.so committed in the ZedSecure repo"
-            echo "libopenconnect.so: prebuilt copy from the ZedSecure repo (source build did not succeed)" | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "libopenconnect.so: extracted from official release v3.1.8" | tee -a "$GITHUB_STEP_SUMMARY"
           find app/src/main/jniLibs -name '*.so' -exec chmod +x {} +
 
       # 4. Sanity checks on the engines
@@ -581,10 +486,9 @@ jobs:
           set -e
           ls -l app/libs/zedcore.aar
           for abi in $ABIS; do
-            for lib in libtor libobfs4proxy libsnowflake libconjure libsnispoof libhev-socks5-tunnel libzeptun libzeptun-jni; do
+            for lib in libtor libobfs4proxy libsnowflake libconjure libsnispoof libhev-socks5-tunnel libzeptun libzeptun-jni libopenconnect; do
               [ -f "app/src/main/jniLibs/$abi/$lib.so" ] || { echo "::error::$abi/$lib.so is missing"; exit 1; }
             done
-            [ -f "app/src/main/jniLibs/$abi/libopenconnect.so" ] || echo "::warning::$abi/libopenconnect.so is missing; OpenConnect will not work"
             for lib in libhev-socks5-tunnel libopenconnect libzeptun-jni; do
               so="app/src/main/jniLibs/$abi/$lib.so"
               [ -f "$so" ] || continue
@@ -678,7 +582,6 @@ jobs:
 
           echo "Publishing release $TAG_NAME..."
 
-          # Try creating the release; if it exists, upload and overwrite (clobber) the assets
           gh release create "$TAG_NAME" dist/ZedSecure-*.apk dist/SHA256SUMS-android.txt \
             --title "$RELEASE_TITLE" \
             --notes "$NOTES" \
