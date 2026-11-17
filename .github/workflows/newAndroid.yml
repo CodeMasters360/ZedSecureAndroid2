@@ -1,4 +1,4 @@
-name: android-release
+name: android-release2
 
 on:
   workflow_dispatch:
