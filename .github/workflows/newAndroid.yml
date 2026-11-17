@@ -1,4 +1,4 @@
-name: android-release
+name: android-release2
 
 on:
   workflow_dispatch:
@@ -443,6 +443,7 @@ jobs:
           mkdir -p "$W/oc-src" && tar -xzf "$W/src/oc.tar.gz" -C "$W/oc-src" --strip-components=1
           JAVA=org/infradead/libopenconnect/LibOpenConnect.java
           if ! diff -q "$W/oc-src/java/src/$JAVA" "app/src/main/java/$JAVA" >/dev/null; then
+            diff -u "$W/oc-src/java/src/$JAVA" "app/src/main/java/$JAVA" || true
             echo "::warning::the app's LibOpenConnect.java differs from openconnect $OC; refusing to ship a JNI library that may not match it"
             exit 1
           fi
