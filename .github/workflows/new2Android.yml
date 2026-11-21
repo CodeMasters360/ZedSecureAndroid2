@@ -1,0 +1,734 @@
+# =============================================================================
+#  Build ZedSecure (Android APKs) completely from source and publish a release
+#
+#  Put this file in YOUR repository as:  .github/workflows/build-zedsecure.yml
+#  Run it from  Actions -> "Build ZedSecure APKs from source" -> Run workflow
+#
+#  Upstream repositories (none of them is yours, nothing is pushed to them):
+#    - https://github.com/CluvexStudio/ZedSecure        the Android app
+#    - https://github.com/CluvexStudio/ZedSecure-Cores  zedcore.aar, tor, hev, ...
+#    - https://github.com/Noisemux/zeptun               libzeptun + libzeptun-jni
+#
+#  On every run the latest commit (HEAD of the default branch) of each of the
+#  three repositories is resolved once, and every job builds exactly that
+#  commit. The app normally DOWNLOADS ready-made engines from the releases of
+#  ZedSecure-Cores / zeptun (tools/get-cores.sh); this workflow never does
+#  that. It compiles every engine itself and puts the results where
+#  get-cores.sh would have put them.
+#
+#  Optional repository secrets (same names the upstream project uses). Without
+#  them a throw-away signing key is generated on each run, which means a new
+#  build can not be installed over an older one signed with another key:
+#    KEYSTORE_BASE64   base64 of your .jks/.p12 keystore
+#    KEYSTORE_PASSWORD keystore password
+#    KEY_ALIAS         key alias
+#    KEY_PASSWORD      key password
+# =============================================================================
+name: Build ZedSecure APKs from source_new by claude
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag. Empty = generate a unique one. If it already exists, the old release and tag are deleted and recreated."
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-zedsecure
+  cancel-in-progress: false
+
+env:
+  APP_REPO: CluvexStudio/ZedSecure
+  CORES_REPO: CluvexStudio/ZedSecure-Cores
+  ZEPTUN_REPO: Noisemux/zeptun
+  ABIS: "arm64-v8a armeabi-v7a x86 x86_64"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Freeze the latest commit of every upstream repository for this run
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      app_sha: ${{ steps.r.outputs.app_sha }}
+      cores_sha: ${{ steps.r.outputs.cores_sha }}
+      zeptun_sha: ${{ steps.r.outputs.zeptun_sha }}
+    steps:
+      - id: r
+        run: |
+          set -euo pipefail
+          head_of() {
+            local sha
+            sha=$(git ls-remote "https://github.com/$1.git" HEAD | awk 'NR==1{print $1}')
+            [ -n "$sha" ] || { echo "::error::could not resolve HEAD of $1"; exit 1; }
+            echo "$sha"
+          }
+          app=$(head_of "$APP_REPO")
+          cores=$(head_of "$CORES_REPO")
+          zeptun=$(head_of "$ZEPTUN_REPO")
+          {
+            echo "app_sha=$app"
+            echo "cores_sha=$cores"
+            echo "zeptun_sha=$zeptun"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream commits used for this build"
+            echo "- ZedSecure: [\`${app:0:10}\`](https://github.com/$APP_REPO/commit/$app)"
+            echo "- ZedSecure-Cores: [\`${cores:0:10}\`](https://github.com/$CORES_REPO/commit/$cores)"
+            echo "- zeptun: [\`${zeptun:0:10}\`](https://github.com/$ZEPTUN_REPO/commit/$zeptun)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 1. zedcore.aar  (Xray + sing-box + Psiphon + DNSTT/VayDNS + MasterDNS)
+  #    gomobile bind -> libgojni.so for 4 ABIs + Java classes
+  # ---------------------------------------------------------------------------
+  zedcore:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Make room
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/node_modules /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+                      "$AGENT_TOOLSDIRECTORY/CodeQL" "$AGENT_TOOLSDIRECTORY/PyPy" \
+                      "$AGENT_TOOLSDIRECTORY/Ruby" /usr/local/.ghcup \
+                      /opt/microsoft /opt/az /opt/google /usr/local/share/chromium /usr/lib/firefox \
+                      /usr/lib/google-cloud-sdk /usr/local/julia* /usr/share/miniconda \
+                      "$ANDROID_HOME/emulator" "$ANDROID_HOME/system-images" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: Every engine at its pinned commit (scripts/fetch.sh + pins.txt)
+        working-directory: cores
+        run: ./scripts/fetch.sh
+
+      - name: Go version requested by the build script
+        id: go
+        working-directory: cores
+        run: |
+          v=$(grep -oE 'GOTOOLCHAIN=go[0-9]+(\.[0-9]+)+' scripts/build-zedcore.sh | head -1 | sed 's/GOTOOLCHAIN=go//' || true)
+          echo "version=${v:-1.27.3}" >> "$GITHUB_OUTPUT"
+          echo "Go ${v:-1.27.3}"
+
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: "21" }
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+          cache-dependency-path: cores/vendor/AndroidLibXrayLite/go.sum
+
+      - name: Install an NDK that can link cronet (NDK 28+)
+        run: |
+          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358"
+          newest=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -1)
+          case "$newest" in
+            2[0-7].*) echo "::error::still on NDK $newest; its linker cannot read the cronet archive"; exit 1 ;;
+          esac
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$newest" >> "$GITHUB_ENV"
+          for old in $(ls -1 "$ANDROID_HOME/ndk" | grep -v "^$newest$"); do
+            sudo rm -rf "$ANDROID_HOME/ndk/$old"
+          done
+          echo "building with NDK $newest"
+          df -h / | tail -1
+
+      - name: gomobile + gobind (built from source with go install)
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Build zedcore.aar
+        working-directory: cores
+        env:
+          ZEDCORE_TMPDIR: ${{ runner.temp }}/zedcore
+        run: |
+          set -e
+          mkdir -p "$ZEDCORE_TMPDIR"
+          ./scripts/build-zedcore.sh
+          for abi in $ABIS; do
+            unzip -l out/zedcore.aar | grep -q "jni/$abi/libgojni.so" || { echo "::error::zedcore.aar has no $abi"; exit 1; }
+          done
+          ls -l out/zedcore.aar
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-zedcore
+          path: cores/out/zedcore.aar
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 2. Tor: libtor.so (Tor + OpenSSL + libevent compiled from source tarballs)
+  #    plus libobfs4proxy.so (lyrebird), libconjure.so, libsnowflake.so (Go)
+  # ---------------------------------------------------------------------------
+  tor:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: Read the versions pinned in the upstream tor workflow
+        id: pins
+        working-directory: cores
+        run: |
+          set -euo pipefail
+          f=.github/workflows/tor.yml
+          pin() {
+            local v
+            v=$(grep -m1 -E "^[[:space:]]+$2:[[:space:]]" "$1" | sed -E 's/^[^:]+:[[:space:]]*"?([^"#]*)"?[[:space:]]*(#.*)?$/\1/' | tr -d '[:space:]' || true)
+            echo "${v:-$3}"
+          }
+          gov=$(grep -m1 -oE 'go-version: *"[^"]+"' "$f" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          {
+            echo "go=${gov:-1.24}"
+            echo "snowflake=$(pin "$f" SNOWFLAKE v2.14.1)"
+            echo "conjure=$(pin "$f" CONJURE v0.0.0-20260113185639-0090962226b8)"
+            echo "lyrebird=$(pin "$f" LYREBIRD v0.0.0-20260115133752-0b10edbb61e0)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        with: { go-version: "${{ steps.pins.outputs.go }}", cache: false }
+
+      - name: libtor.so with the fake-SNI patch (Tor, OpenSSL, libevent from source)
+        working-directory: cores
+        run: |
+          set -euo pipefail
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          NDK="$NDK" OUT="$PWD/out" WORK="$RUNNER_TEMP/tor-build" ./scripts/build-tor-android.sh
+          for abi in $ABIS; do
+            so="out/$abi/libtor.so"
+            [ -s "$so" ] || { echo "::error::$so is missing"; exit 1; }
+            grep -aq -- '--fake-hosts' "$so" || echo "::warning::$abi tor does not seem to carry the fake SNI patch"
+          done
+
+      - name: lyrebird, Conjure and Snowflake for every ABI (Go, from source)
+        working-directory: cores
+        env:
+          SNOWFLAKE: ${{ steps.pins.outputs.snowflake }}
+          CONJURE: ${{ steps.pins.outputs.conjure }}
+          LYREBIRD: ${{ steps.pins.outputs.lyrebird }}
+        run: |
+          set -euo pipefail
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OUTD="$PWD/out"
+          src() { go mod download -json "$1@$2" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Dir"])'; }
+          PT=gitlab.torproject.org/tpo/anti-censorship/pluggable-transports
+          LYREBIRD_DIR=$(src "$PT/lyrebird" "$LYREBIRD")
+          CONJURE_DIR=$(src "$PT/conjure" "$CONJURE")
+          SNOWFLAKE_DIR=$(src "$PT/snowflake/v2" "$SNOWFLAKE")
+          [ -d "$LYREBIRD_DIR/cmd/lyrebird" ] && [ -d "$CONJURE_DIR/client" ] && [ -d "$SNOWFLAKE_DIR/client" ] \
+            || { echo "::error::a pluggable transport did not come through the Go module proxy"; exit 1; }
+          for triple in "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+                        "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+                        "386:x86:i686-linux-android24-clang" \
+                        "amd64:x86_64:x86_64-linux-android24-clang"; do
+            arch=${triple%%:*}; rest=${triple#*:}; abi=${rest%%:*}; cc=${rest#*:}
+            export CGO_ENABLED=1 CC="$BIN/$cc" GOOS=android GOARCH=$arch GOARM=7
+            LD="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384"
+            ( cd "$LYREBIRD_DIR"   && go build -trimpath -ldflags="$LD" -o "$OUTD/$abi/libobfs4proxy.so" ./cmd/lyrebird )
+            ( cd "$CONJURE_DIR"    && go build -trimpath -ldflags="$LD" -o "$OUTD/$abi/libconjure.so"    ./client )
+            ( cd "$SNOWFLAKE_DIR"  && go build -trimpath -ldflags="$LD" -o "$OUTD/$abi/libsnowflake.so"  ./client )
+          done
+
+      - name: One zip per ABI
+        working-directory: cores
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for abi in $ABIS; do
+            for lib in libtor libobfs4proxy libconjure libsnowflake; do
+              [ -s "out/$abi/$lib.so" ] || { echo "::error::$abi/$lib.so is missing"; exit 1; }
+            done
+            chmod +x out/"$abi"/*.so
+            ( cd "out/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/tor-android-$abi.zip" libtor.so libobfs4proxy.so libconjure.so libsnowflake.so )
+          done
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v7
+        with: { name: core-tor, path: "dist/*", if-no-files-found: error, retention-days: 1 }
+
+  # ---------------------------------------------------------------------------
+  # 3. SNI-Spoofing-Go -> libsnispoof.so
+  # ---------------------------------------------------------------------------
+  snispoof:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: Read the versions pinned in the upstream snispoof workflow
+        id: pins
+        working-directory: cores
+        run: |
+          set -euo pipefail
+          f=.github/workflows/snispoof.yml
+          v=$(grep -m1 -E '^[[:space:]]+SNISPOOF:[[:space:]]' "$f" | sed -E 's/^[^:]+:[[:space:]]*"?([^"#]*)"?.*$/\1/' | tr -d '[:space:]' || true)
+          gov=$(grep -m1 -oE 'go-version: *"[^"]+"' "$f" | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          { echo "snispoof=${v:-v0.7.2}"; echo "go=${gov:-1.26.3}"; } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        with: { go-version: "${{ steps.pins.outputs.go }}", cache: false }
+
+      - name: SNI-Spoofing-Go for every ABI (from source)
+        env:
+          SNISPOOF: ${{ steps.pins.outputs.snispoof }}
+        run: |
+          set -euo pipefail
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          git clone -q --depth 1 -b "$SNISPOOF" https://github.com/aleskxyz/SNI-Spoofing-Go.git src
+          mkdir -p dist
+          for triple in "arm64:arm64-v8a:aarch64-linux-android24-clang" \
+                        "arm:armeabi-v7a:armv7a-linux-androideabi24-clang" \
+                        "386:x86:i686-linux-android24-clang" \
+                        "amd64:x86_64:x86_64-linux-android24-clang"; do
+            arch=${triple%%:*}; rest=${triple#*:}; abi=${rest%%:*}; cc=${rest#*:}
+            mkdir -p "out/$abi"
+            ( cd src && CGO_ENABLED=1 CC="$BIN/$cc" GOOS=android GOARCH=$arch GOARM=7 \
+                go build -trimpath -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" -o "$GITHUB_WORKSPACE/out/$abi/libsnispoof.so" . )
+            chmod +x "out/$abi/libsnispoof.so"
+            ( cd "out/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/snispoof-android-$abi.zip" libsnispoof.so )
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with: { name: core-snispoof, path: "dist/*", if-no-files-found: error, retention-days: 1 }
+
+  # ---------------------------------------------------------------------------
+  # 4. hev-socks5-tunnel -> libhev-socks5-tunnel.so (ndk-build)
+  # ---------------------------------------------------------------------------
+  hev:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: Read the version pinned in the upstream hev workflow
+        id: pins
+        working-directory: cores
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 -E '^[[:space:]]+HEV:[[:space:]]' .github/workflows/hev.yml | sed -E 's/^[^:]+:[[:space:]]*"?([^"#]*)"?.*$/\1/' | tr -d '[:space:]' || true)
+          echo "hev=${v:-2.18.0}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: hev-socks5-tunnel as the JNI library the app loads (from source)
+        env:
+          HEV: ${{ steps.pins.outputs.hev }}
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch "$HEV" --recursive https://github.com/heiher/hev-socks5-tunnel hev/jni
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          "$NDK/ndk-build" -C hev -j"$(nproc)" APP_ABI="$ABIS" APP_MODULES=hev-socks5-tunnel APP_PLATFORM=android-24
+          mkdir -p dist
+          for abi in $ABIS; do
+            so="hev/libs/$abi/libhev-socks5-tunnel.so"
+            [ -s "$so" ] || { echo "::error::$so was not built"; exit 1; }
+            readelf --dyn-syms -W "$so" | grep -qw JNI_OnLoad || echo "::warning::$abi: hev has no JNI_OnLoad"
+            if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then echo "::warning::$abi: hev uses RELR relocations (Android 7/8 cannot load it)"; fi
+            ( cd "hev/libs/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/hev-android-$abi.zip" libhev-socks5-tunnel.so )
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with: { name: core-hev, path: "dist/*", if-no-files-found: error, retention-days: 1 }
+
+  # ---------------------------------------------------------------------------
+  # 5. OpenConnect -> libopenconnect.so (autotools + NDK; its android/Makefile
+  #    downloads and compiles libxml2, gmp, nettle, gnutls, stoken, lz4)
+  # ---------------------------------------------------------------------------
+  openconnect:
+    name: openconnect (${{ matrix.abi }})
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64,  abi: arm64-v8a,   triplet: aarch64-linux-android }
+          - { arch: arm,    abi: armeabi-v7a, triplet: armv7a-linux-androideabi }
+          - { arch: x86,    abi: x86,         triplet: i686-linux-android }
+          - { arch: x86_64, abi: x86_64,      triplet: x86_64-linux-android }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: OpenConnect as the JNI library the app loads (from source)
+        run: |
+          set -euo pipefail
+          COMMIT=$(grep -m1 -E '^[[:space:]]+OPENCONNECT_ANDROID_COMMIT:[[:space:]]' cores/.github/workflows/openconnect.yml | sed -E 's/^[^:]+:[[:space:]]*"?([^"#]*)"?.*$/\1/' | tr -d '[:space:]' || true)
+          COMMIT=${COMMIT:-70d1e79d1e55849dfc71dcc199b1edb535b547e4}
+          echo "OpenConnect commit: $COMMIT"
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends autoconf automake libtool pkg-config gettext gperf bison make gcc python3 file zip
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          bin="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          printf 'int main(void){return 0;}\n' > /tmp/probe.c
+          "$bin/${{ matrix.triplet }}24-clang" /tmp/probe.c -o /tmp/probe
+          git init -q oc
+          cd oc
+          git remote add origin https://gitlab.com/openconnect/openconnect.git
+          git fetch -q --depth 1 origin "$COMMIT"
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          git apply "$GITHUB_WORKSPACE/cores/patches/openconnect-android.patch"
+          ./autogen.sh
+          make -C android ARCH=${{ matrix.arch }} NDK="$NDK" API_LEVEL=24 \
+            EXTRA_LDFLAGS="-Wl,-z,max-page-size=16384,-z,common-page-size=16384" -j"$(nproc)" openconnect
+          so=$(find android/${{ matrix.triplet }}/out -name 'libopenconnect.so*' -type f | head -1)
+          test -n "$so"
+          n=$(nm -D --defined-only "$so" | grep -c 'Java_org_infradead_libopenconnect_LibOpenConnect_' || true)
+          echo "JNI symbols: $n"
+          [ "$n" -ge 78 ] || echo "::warning::${{ matrix.abi }}: only $n JNI symbols found in libopenconnect.so"
+          mkdir -p lib "$GITHUB_WORKSPACE/dist"
+          cp "$so" lib/libopenconnect.so
+          "$bin/llvm-strip" --strip-unneeded lib/libopenconnect.so
+          ( cd lib && zip -q -X "$GITHUB_WORKSPACE/dist/openconnect-android-${{ matrix.abi }}.zip" libopenconnect.so )
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: core-openconnect-${{ matrix.abi }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 6. zedscan (Rust) -> libzedscan.so + libzedscan_cli.so
+  # ---------------------------------------------------------------------------
+  zedscan:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CORES_REPO }}
+          ref: ${{ needs.resolve.outputs.cores_sha }}
+          path: cores
+
+      - name: The scanner as the JNI library the app loads (Rust, from source)
+        working-directory: cores/zedscan
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+          cargo install cargo-ndk --locked
+          export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 --platform 24 -o out build --release
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for t in aarch64-linux-android:arm64-v8a armv7-linux-androideabi:armeabi-v7a i686-linux-android:x86 x86_64-linux-android:x86_64; do
+            cp "target/${t%%:*}/release/zedscan" "out/${t##*:}/libzedscan_cli.so"
+          done
+          for abi in $ABIS; do
+            so="out/$abi/libzedscan.so"
+            [ -s "$so" ] || { echo "::error::$so was not built"; exit 1; }
+            n=$(nm -D --defined-only "$so" | grep -c 'Java_dev_cluvex_zedsecure_scan_ZedScanNative_' || true)
+            [ "$n" -ge 5 ] || echo "::warning::$abi exports only $n JNI functions"
+            ( cd "out/$abi" && zip -q -X "$GITHUB_WORKSPACE/dist/zedscan-android-$abi.zip" libzedscan.so libzedscan_cli.so )
+          done
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v7
+        with: { name: core-zedscan, path: "dist/*", if-no-files-found: error, retention-days: 1 }
+
+  # ---------------------------------------------------------------------------
+  # 7. zeptun (Zig) -> libzeptun.so + libzeptun-jni.so (ndk-build)
+  # ---------------------------------------------------------------------------
+  zeptun:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ZEPTUN_REPO }}
+          ref: ${{ needs.resolve.outputs.zeptun_sha }}
+          path: zeptun
+
+      - name: Zig version requested by zeptun
+        id: zig
+        working-directory: zeptun
+        run: |
+          v=$(grep -m1 -E '^[[:space:]]*ZIG_VERSION:' .github/workflows/release.yml | sed -E 's/^[^:]+:[[:space:]]*"?([^"#[:space:]]*)"?.*$/\1/' || true)
+          [ -n "$v" ] || v=$(grep -m1 minimum_zig_version build.zig.zon | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          echo "version=${v:-0.17.1}" | tee -a "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Build libzeptun.so and libzeptun-jni.so
+        working-directory: zeptun
+        run: |
+          set -euo pipefail
+          NDK=${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1); fi
+          echo "NDK: $NDK"
+          ANDROID_NDK_HOME="$NDK" sh scripts/build_android.sh
+          for abi in $ABIS; do
+            for lib in libzeptun libzeptun-jni; do
+              [ -s "zig-out/android/jniLibs/$abi/$lib.so" ] || { echo "::error::$abi/$lib.so is missing"; exit 1; }
+            done
+            align=$(readelf -lW "zig-out/android/jniLibs/$abi/libzeptun.so" | awk '$1 == "LOAD" { print $NF; exit }')
+            [ "$align" = "0x4000" ] || echo "::warning::$abi/libzeptun.so is not 16 KB aligned ($align)"
+          done
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp include/zeptun.h zig-out/android/
+          ( cd zig-out/android && zip -q -r -X "$GITHUB_WORKSPACE/dist/zeptun-android-jniLibs.zip" jniLibs zeptun.h )
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v7
+        with: { name: core-zeptun, path: "dist/*", if-no-files-found: error, retention-days: 1 }
+
+  # ---------------------------------------------------------------------------
+  # 8. The app itself: assemble the engines and build + sign the APKs
+  # ---------------------------------------------------------------------------
+  apk:
+    needs: [resolve, zedcore, tor, snispoof, hev, openconnect, zedscan, zeptun]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.v.outputs.name }}
+      key_kind: ${{ steps.key.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ needs.resolve.outputs.app_sha }}
+
+      # JDK 17 is the Kotlin/Java toolchain of the project, JDK 21 runs Gradle.
+      # The last one listed becomes JAVA_HOME.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Read the version
+        id: v
+        run: echo "name=$(grep '^zedsecure.versionName=' gradle.properties | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/cores
+          pattern: core-*
+          merge-multiple: true
+
+      - name: Put the engines we just built where the app expects them
+        run: |
+          set -euo pipefail
+          C=/tmp/cores
+          ls -l "$C"
+          jni=app/src/main/jniLibs
+          mkdir -p app/libs "$jni"
+          [ -s "$C/zedcore.aar" ] || { echo "::error::zedcore.aar is missing"; exit 1; }
+          cp "$C/zedcore.aar" app/libs/zedcore.aar
+          for abi in $ABIS; do
+            mkdir -p "$jni/$abi"
+            for core in tor snispoof hev zedscan openconnect; do
+              z="$C/$core-android-$abi.zip"
+              [ -f "$z" ] || { echo "::error::$z is missing"; exit 1; }
+              unzip -q -o "$z" -d "$jni/$abi"
+            done
+          done
+          mkdir -p /tmp/zeptun-unpacked
+          unzip -q -o "$C/zeptun-android-jniLibs.zip" -d /tmp/zeptun-unpacked
+          cp -r /tmp/zeptun-unpacked/jniLibs/. "$jni/"
+          find "$jni" -name '*.so' -exec chmod +x {} +
+
+      - name: Check the engines
+        run: |
+          set -e
+          ls -l app/libs/zedcore.aar
+          for abi in $ABIS; do
+            for lib in libtor libobfs4proxy libsnowflake libconjure libsnispoof libhev-socks5-tunnel libopenconnect libzedscan libzeptun libzeptun-jni; do
+              [ -f "app/src/main/jniLibs/$abi/$lib.so" ] || echo "::warning::$abi/$lib.so is missing; that feature will not work"
+            done
+            for so in app/src/main/jniLibs/$abi/*.so; do
+              case "$so" in */libzeptun*) continue ;; esac
+              if readelf -d "$so" | grep -qE '\(RELR\)|0x0*6fffe000 '; then echo "::warning::$so uses RELR relocations, which Android 7 and 8 cannot load"; fi
+            done
+          done
+          find app/src/main/jniLibs -name '*.so' | sort
+
+      - name: Signing key
+        id: key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > release.keystore
+            STORE_PW="$KEYSTORE_PASSWORD"; KEY_PW="$KEY_PASSWORD"; ALIAS="$KEY_ALIAS"
+            echo "kind=your own key (from repository secrets)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No signing secrets found. Generating a throw-away key; this build can not update an app signed with another key."
+            STORE_PW=$(openssl rand -hex 16); KEY_PW="$STORE_PW"; ALIAS=zedsecure
+            keytool -genkeypair -keystore release.keystore -storetype PKCS12 -alias "$ALIAS" \
+              -keyalg RSA -keysize 4096 -validity 36500 \
+              -storepass "$STORE_PW" -keypass "$KEY_PW" \
+              -dname "CN=ZedSecure unofficial build, O=CI" >/dev/null
+            echo "kind=a throw-away key generated for this run" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::add-mask::$STORE_PW"
+          echo "::add-mask::$KEY_PW"
+          { echo "storeFile=release.keystore"; echo "storePassword=$STORE_PW"
+            echo "keyPassword=$KEY_PW"; echo "keyAlias=$ALIAS"; } > keystore.properties
+
+      - name: Build the release APKs (one per ABI)
+        run: ./gradlew --warning-mode all :app:assembleRelease
+
+      - name: Name them, make the universal APK, sign and verify
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          V='${{ steps.v.outputs.name }}'
+          for abi in $ABIS; do
+            src="app/build/outputs/apk/release/app-$abi-release.apk"
+            [ -f "$src" ] || { echo "::error::$src was not built"; exit 1; }
+            cp "$src" "dist/ZedSecure-$V-$abi.apk"
+          done
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ -f tools/universal-apk.py ]; then
+            python3 tools/universal-apk.py "dist/ZedSecure-$V-arm64-v8a.apk" /tmp/universal.apk "dist/ZedSecure-$V-armeabi-v7a.apk"
+            "$BT/zipalign" -f -P 16 4 /tmp/universal.apk /tmp/universal-aligned.apk
+            STORE_PW=$(grep '^storePassword=' keystore.properties | cut -d= -f2-) \
+            KEY_PW=$(grep '^keyPassword=' keystore.properties | cut -d= -f2-) \
+            "$BT/apksigner" sign --ks release.keystore \
+              --ks-key-alias "$(grep '^keyAlias=' keystore.properties | cut -d= -f2-)" \
+              --ks-pass env:STORE_PW --key-pass env:KEY_PW \
+              --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled false --v4-signing-enabled false \
+              --out "dist/ZedSecure-$V-universal.apk" /tmp/universal-aligned.apk
+            rm -f /tmp/universal.apk /tmp/universal-aligned.apk
+            "$BT/aapt2" dump badging "dist/ZedSecure-$V-universal.apk" | grep -q "native-code: 'arm64-v8a' 'armeabi-v7a'" \
+              || echo "::warning::the universal APK does not list both ARM ABIs"
+          else
+            echo "::warning::tools/universal-apk.py not found in this commit; skipping the universal APK"
+          fi
+          base=$("$BT/apksigner" verify --print-certs "dist/ZedSecure-$V-arm64-v8a.apk" | grep -m1 'SHA-256' | awk '{print $NF}')
+          for apk in dist/ZedSecure-*.apk; do
+            "$BT/apksigner" verify "$apk"
+            a=$("$BT/apksigner" verify --print-certs "$apk" | grep -m1 'SHA-256' | awk '{print $NF}')
+            [ "$a" = "$base" ] || { echo "::error::$apk is signed with a different key"; exit 1; }
+          done
+          ( cd dist && sha256sum ZedSecure-*.apk > SHA256SUMS.txt )
+          ls -l dist
+
+      - name: Forget the key
+        if: always()
+        run: shred -u release.keystore keystore.properties 2>/dev/null || rm -f release.keystore keystore.properties
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apks
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 9. Publish a release in THIS repository (no tag or version needed)
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [resolve, apk]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: apks
+          path: dist
+
+      - name: Create (or force-replace) the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          VERSION: ${{ needs.apk.outputs.version }}
+          KEY_KIND: ${{ needs.apk.outputs.key_kind }}
+          APP_SHA: ${{ needs.resolve.outputs.app_sha }}
+          CORES_SHA: ${{ needs.resolve.outputs.cores_sha }}
+          ZEPTUN_SHA: ${{ needs.resolve.outputs.zeptun_sha }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG="zedsecure-v${VERSION}-$(date -u +%Y%m%d-%H%M%S)-run${GITHUB_RUN_NUMBER}"
+          fi
+
+          # Force: remove an old release and/or a stray tag with the same name.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG"
+          fi
+
+          cat > notes.md <<EOF
+          ZedSecure ${VERSION} compiled entirely from source by GitHub Actions.
+
+          Upstream commits that were built:
+          - ZedSecure: [\`${APP_SHA:0:10}\`](https://github.com/${APP_REPO}/commit/${APP_SHA})
+          - ZedSecure-Cores: [\`${CORES_SHA:0:10}\`](https://github.com/${CORES_REPO}/commit/${CORES_SHA})
+          - zeptun: [\`${ZEPTUN_SHA:0:10}\`](https://github.com/${ZEPTUN_REPO}/commit/${ZEPTUN_SHA})
+
+          Which APK: \`arm64-v8a\` for almost every phone, \`armeabi-v7a\` for old 32-bit ARM phones,
+          \`x86\`/\`x86_64\` for emulators and Chromebooks, \`universal\` = arm64 + armeabi-v7a in one file.
+
+          Signed with: ${KEY_KIND}.
+          Unofficial build, not affiliated with the ZedSecure authors. Check SHA256SUMS.txt.
+          EOF
+
+          args=(--repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+                --title "ZedSecure ${VERSION} (source build ${APP_SHA:0:7})"
+                --notes-file notes.md)
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); else args+=(--latest); fi
+
+          gh release create "$TAG" dist/* "${args[@]}"
+          echo "### Release created: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
